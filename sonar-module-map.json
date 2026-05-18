@@ -1,0 +1,13 @@
+﻿{
+    "modules":  {
+                    "frontend":  [
+                                     "index.php",
+                                     "style.css"
+                                 ],
+                    "backend":  [
+                                    "index.php",
+                                    "db.php"
+                                ]
+                },
+    "project_key":  "note-list-1"
+}

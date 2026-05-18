@@ -1,0 +1,29 @@
+﻿{
+    "mcpServers":  {
+                       "mkb":  {
+                                   "type":  "sse",
+                                   "url":  "http://localhost:8765/sse"
+                               },
+                       "workflow":  {
+                                        "type":  "sse",
+                                        "url":  "http://localhost:8766/sse"
+                                    }
+                   },
+    "permissions":  {
+                        "allow":  [
+                                      "mcp__mkb__mkb_store_artifact",
+                                      "mcp__mkb__mkb_query_semantic",
+                                      "mcp__mkb__mkb_get_artifact",
+                                      "mcp__mkb__mkb_get_business_rules",
+                                      "mcp__workflow__create_mwu",
+                                      "mcp__workflow__update_mwu_state",
+                                      "mcp__workflow__get_mwu",
+                                      "mcp__workflow__list_mwus",
+                                      "Bash(python:*)",
+                                      "Bash(docker:*)",
+                                      "Bash(git:*)",
+                                      "Bash(pwsh:*)",
+                                      "Write(CLAUDE.md)"
+                                  ]
+                    }
+}
