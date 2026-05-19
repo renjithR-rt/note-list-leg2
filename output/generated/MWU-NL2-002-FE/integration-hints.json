@@ -1,0 +1,49 @@
+{
+  "mwu_id": "MWU-NL2-002-FE",
+  "module": "frontend",
+  "depends_on_modules": [],
+  "files_generated": [
+    "src/main.tsx",
+    "src/App.tsx",
+    "src/types/note.ts",
+    "src/types/props.ts",
+    "src/api/notesApi.ts",
+    "src/validation/noteValidation.ts",
+    "src/utils/dateUtils.ts",
+    "src/components/Header.tsx",
+    "src/components/Footer.tsx",
+    "src/components/FeedbackMessage.tsx",
+    "src/components/AddNoteForm.tsx",
+    "src/components/NoteItem.tsx",
+    "src/components/NoteList.tsx",
+    "src/index.css"
+  ],
+  "routers": [],
+  "smoke_test_endpoints": [
+    {"method": "GET", "path": "/notes", "expect_status": [200, 500]},
+    {"method": "POST", "path": "/notes", "expect_status": [201, 422, 500]},
+    {"method": "DELETE", "path": "/notes/1", "expect_status": [204, 404, 500]}
+  ],
+  "migration_sql": [],
+  "utilities_added": [],
+  "frontend_build": {
+    "framework": "React 18",
+    "bundler": "Vite",
+    "language": "TypeScript",
+    "dev_server_port": 5173,
+    "api_proxy_target": "http://localhost:8000"
+  },
+  "business_rules_implemented": [
+    "BR-NL-FE-001",
+    "BR-NL-FE-002", 
+    "BR-NL-FE-003",
+    "BR-NL-FE-004",
+    "BR-NL-FE-005",
+    "BR-NL-FE-006",
+    "BR-NL-FE-007",
+    "BR-NL-FE-008",
+    "BR-NL-FE-009",
+    "BR-NL-FE-010",
+    "BR-NL-FE-011"
+  ]
+}
