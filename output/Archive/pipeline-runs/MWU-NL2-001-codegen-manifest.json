@@ -1,0 +1,41 @@
+{
+  "mwu_id": "MWU-NL2-001",
+  "phase": "codegen",
+  "timestamp": "2026-05-18T20:37:03.758539+00:00",
+  "total_tokens": 14828,
+  "sections": [
+    {
+      "name": "business_rules",
+      "mode": "full",
+      "br_count": 0,
+      "chars": 40,
+      "tokens_estimate": 9
+    },
+    {
+      "name": "primary",
+      "planning_found": true,
+      "comprehension_found": true,
+      "chars": 45807,
+      "tokens_estimate": 11777
+    },
+    {
+      "name": "track_b",
+      "files_summarized": [
+        "sonar-issues.json"
+      ],
+      "chars": 123,
+      "tokens_estimate": 44
+    }
+  ],
+  "excluded": [
+    {
+      "name": "exemplars",
+      "reason": "no approved exemplars found in output/generated/"
+    },
+    {
+      "name": "function_index",
+      "reason": "function-index.md not found at output/mkb/includes/track-a/"
+    }
+  ],
+  "prompt_file": "output/pipeline-runs/MWU-NL2-001-codegen-prompt.md"
+}

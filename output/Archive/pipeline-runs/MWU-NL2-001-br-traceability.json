@@ -1,0 +1,33 @@
+{
+  "mwu_id": "MWU-NL2-001",
+  "generated_at": "2026-05-19T05:02:06.200558+00:00",
+  "br_coverage": {
+    "BR-BACKEND-006": [
+      "app\\modules\\notes\\schemas.py:23",
+      "app\\modules\\notes\\service.py:38"
+    ],
+    "BR-BACKEND-001": [
+      "app\\modules\\notes\\schemas.py:31",
+      "app\\modules\\notes\\service.py:38"
+    ],
+    "BR-BACKEND-005": [
+      "app\\modules\\notes\\service.py:22"
+    ],
+    "BR-BACKEND-008": [
+      "app\\modules\\notes\\service.py:22"
+    ],
+    "BR-BACKEND-002": [
+      "app\\modules\\notes\\service.py:38"
+    ],
+    "BR-BACKEND-003": [
+      "app\\modules\\notes\\service.py:61"
+    ],
+    "BR-BACKEND-007": [
+      "app\\modules\\notes\\service.py:62"
+    ]
+  },
+  "uncovered_brs": [
+    "BR-BACKEND-004",
+    "BR-RISK-004"
+  ]
+}

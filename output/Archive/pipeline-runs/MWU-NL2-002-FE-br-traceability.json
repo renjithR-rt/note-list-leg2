@@ -1,0 +1,11 @@
+{
+  "mwu_id": "MWU-NL2-002-FE",
+  "generated_at": "2026-05-19T06:33:30.935690+00:00",
+  "br_coverage": {},
+  "uncovered_brs": [
+    "BR-FRONTEND-001",
+    "BR-FRONTEND-011",
+    "BR-NL-002",
+    "BR-NL-007"
+  ]
+}

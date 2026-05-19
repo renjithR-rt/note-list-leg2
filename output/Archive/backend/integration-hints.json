@@ -1,0 +1,40 @@
+{
+  "mwu_id": "MWU-NL-001",
+  "module": "backend",
+  "depends_on_modules": [],
+  "files_generated": [
+    "app/modules/backend/models.py",
+    "app/modules/backend/schemas.py", 
+    "app/modules/backend/service.py",
+    "app/modules/backend/router.py",
+    "app/modules/backend/__init__.py",
+    "app/modules/backend/stubs.py"
+  ],
+  "routers": [
+    {
+      "import_path": "app.modules.backend.router",
+      "variable": "router",
+      "alias": "backend_router", 
+      "tag": "notes"
+    }
+  ],
+  "smoke_test_endpoints": [
+    {"method": "GET", "path": "/notes/", "expect_status": [200]},
+    {"method": "POST", "path": "/notes/", "body": {"content": "test"}, "expect_status": [201]},
+    {"method": "DELETE", "path": "/notes/999999", "expect_status": [404]}
+  ],
+  "migration_sql": ["migrations/001_create_notes_table.sql"],
+  "utilities_added": [],
+  "hitl_gates_pending": [
+    {
+      "gate_id": "BR-BACKEND-007",
+      "description": "DELETE behavior for missing note: 404 (implemented) vs silent success (legacy)",
+      "current_implementation": "404_on_missing",
+      "revert_instructions": "In service.py delete_note(), replace rowcount check with: return DeleteResult(ok=True, message='Deleted')"
+    }
+  ],
+  "business_rules_implemented": [
+    "BR-BACKEND-001", "BR-BACKEND-002", "BR-BACKEND-003", 
+    "BR-BACKEND-004", "BR-BACKEND-005", "BR-BACKEND-006", "BR-BACKEND-007"
+  ]
+}
