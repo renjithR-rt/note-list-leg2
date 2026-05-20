@@ -1,1 +1,0 @@
-"""Notes module - simple note management without authentication."""

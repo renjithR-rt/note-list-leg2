@@ -16,3 +16,7 @@ __pycache__/
 *.secrets
 __pycache__/
 *.pyc
+
+output-archive/
+**/.mcp-config-resolved.json
+.mcp-config-resolved.json
