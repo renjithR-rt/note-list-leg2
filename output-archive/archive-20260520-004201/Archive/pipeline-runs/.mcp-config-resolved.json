@@ -1,0 +1,124 @@
+{
+  "_doc_ref": "Config Guide §3.1 — Engine-level MCP registry. Engagement-agnostic.",
+  "_note": "Paths and tokens come from .env.config / .env.secrets in engagement root.",
+  "_pending_note": "Servers marked PENDING_P* are not built yet. Do not activate.",
+
+  "mcpServers": {
+
+    "mkb": {
+      "type": "sse",
+      "url": "http://localhost:8765/sse",
+      "_note": "BUILT 2026-03-26. PostgreSQL + pgvector + FastMCP. project_id required on all calls."
+    },
+
+    "workflow": {
+      "type": "sse",
+      "url": "http://localhost:8766/sse",
+      "_note": "BUILT. State machine for MWU lifecycle. 23 states."
+    },
+
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "E:\\Claude\\note-list-leg2\\source",
+        "E:\\Claude\\note-list-leg2\\output\\backend",
+        "E:\\Claude\\note-list-leg2\\output\\mkb",
+        "E:\\Claude\\note-list-leg2\\output\\pipeline-runs"
+      ],
+      "_note": "Paths resolved from .env.config at engagement root. Auto-detected by config.py."
+    },
+
+    "postgres": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-postgres"
+      ],
+      "env": {
+        "DATABASE_URL": "postgresql://notelist:notelist@localhost:5436/notelist_modern"
+      },
+      "_note": "Points at engagement target DB. FA=:5433, payroll=:5434. Set in .env.config."
+    },
+
+    "github": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "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"
+      },
+      "_note": "Token from .env.secrets. Multi-account via GITHUB_TOKEN_MAP in config.py."
+    },
+
+    "git": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-git"],
+      "_note": "Local git operations — branch, commit, diff."
+    },
+
+    "mcp-server-ast_PENDING_P0": {
+      "command": "PENDING",
+      "args": [],
+      "_stub": "P0 bespoke — not built. Use tree-sitter CLI via bash directly."
+    },
+
+    "traceability_PENDING_P0": {
+      "command": "PENDING",
+      "args": [],
+      "_stub": "P0 bespoke — not built. Traceability header parsing + auto-linker."
+    },
+
+    "audit_PENDING_P0": {
+      "command": "PENDING",
+      "args": [],
+      "_stub": "P0 bespoke — not built. Immutable audit log for all agent actions."
+    },
+
+    "schema_PENDING_P1": {
+      "command": "PENDING",
+      "args": [],
+      "env": {
+        "SOURCE_DB_URL": "${SOURCE_DB_URL}",
+        "TARGET_DB_URL": "postgresql://notelist:notelist@localhost:5436/notelist_modern"
+      },
+      "_stub": "P1 bespoke — not built. Schema comparison + DDL migration."
+    },
+
+    "dual-run_PENDING_P1": {
+      "command": "PENDING",
+      "args": [],
+      "env": {
+        "LEGACY_BASE_URL": "${LEGACY_API_URL}",
+        "MIGRATED_BASE_URL": "${MIGRATED_API_URL}"
+      },
+      "_stub": "P1 bespoke — not built. Parallel execution + response comparison."
+    },
+
+    "golden-dataset_PENDING_P1": {
+      "command": "PENDING",
+      "args": [],
+      "_stub": "P1 bespoke — not built. Golden dataset management for validation."
+    },
+
+    "go-nogo_PENDING_P2": {
+      "command": "PENDING",
+      "args": [],
+      "_stub": "P2 bespoke — not built. Go/No-Go evidence assembly."
+    },
+
+    "metrics_PENDING_P2": {
+      "command": "PENDING",
+      "args": [],
+      "_stub": "P2 bespoke — not built. Velocity, defect rate, coverage metrics."
+    },
+
+    "learning_PENDING_P2": {
+      "command": "PENDING",
+      "args": [],
+      "_stub": "P2 bespoke — not built. Organisational learning flywheel."
+    }
+  }
+}
+

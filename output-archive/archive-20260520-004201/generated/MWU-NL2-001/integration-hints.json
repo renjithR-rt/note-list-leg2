@@ -1,0 +1,27 @@
+{
+  "mwu_id": "MWU-NL2-001",
+  "module": "notes",
+  "depends_on_modules": [],
+  "files_generated": [
+    "app/modules/notes/__init__.py",
+    "app/modules/notes/models.py",
+    "app/modules/notes/schemas.py",
+    "app/modules/notes/service.py",
+    "app/modules/notes/router.py"
+  ],
+  "routers": [
+    {
+      "import_path": "app.modules.notes.router",
+      "variable": "router",
+      "alias": "notes_router",
+      "tag": "notes"
+    }
+  ],
+  "smoke_test_endpoints": [
+    {"method": "GET", "path": "/api/notes", "expect_status": [200]},
+    {"method": "POST", "path": "/api/notes", "expect_status": [201, 422]},
+    {"method": "DELETE", "path": "/api/notes/1", "expect_status": [204, 404]}
+  ],
+  "migration_sql": ["migrations/001_initial.sql"],
+  "utilities_added": []
+}

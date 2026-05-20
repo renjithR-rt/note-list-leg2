@@ -1,0 +1,57 @@
+.note-item {
+  background-color: white;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  padding: 16px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+.note-item__content {
+  margin-bottom: 12px;
+}
+
+.note-item__text {
+  margin: 0;
+  line-height: 1.5;
+  color: #333;
+  word-wrap: break-word;
+  white-space: pre-wrap;
+}
+
+.note-item__meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-top: 8px;
+  border-top: 1px solid #eee;
+}
+
+.note-item__date {
+  color: #6c757d;
+  font-size: 12px;
+}
+
+.note-item__delete {
+  background-color: #dc3545;
+  color: white;
+  border: none;
+  padding: 4px 8px;
+  font-size: 12px;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.note-item__delete:hover:not(:disabled) {
+  background-color: #c82333;
+}
+
+.note-item__delete:disabled {
+  background-color: #6c757d;
+  cursor: not-allowed;
+}
+
+.note-item__delete:focus {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(220, 53, 69, 0.5);
+}

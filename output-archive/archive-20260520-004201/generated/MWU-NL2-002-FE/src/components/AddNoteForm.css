@@ -1,0 +1,97 @@
+.add-note-form {
+  background-color: #f8f9fa;
+  padding: 20px;
+  border-radius: 6px;
+  margin-bottom: 24px;
+}
+
+.add-note-form__field {
+  margin-bottom: 16px;
+}
+
+.add-note-form__label {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 8px;
+  color: #333;
+}
+
+.add-note-form__textarea {
+  width: 100%;
+  padding: 12px;
+  border: 2px solid #ddd;
+  border-radius: 4px;
+  font-size: 14px;
+  font-family: inherit;
+  line-height: 1.5;
+  resize: vertical;
+  min-height: 80px;
+}
+
+.add-note-form__textarea:focus {
+  outline: none;
+  border-color: #007bff;
+  box-shadow: 0 0 0 2px rgba(0, 123, 255, 0.25);
+}
+
+.add-note-form__textarea:disabled {
+  background-color: #f5f5f5;
+  cursor: not-allowed;
+}
+
+.add-note-form__meta {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+
+.add-note-form__counter.counter {
+  font-size: 12px;
+  color: #666;
+}
+
+.counter--warning {
+  color: #fd7e14;
+  font-weight: 600;
+}
+
+.counter--over {
+  color: #dc3545;
+  font-weight: 600;
+}
+
+.add-note-form__error {
+  color: #dc3545;
+  font-size: 14px;
+  margin-top: 8px;
+  padding: 8px;
+  background-color: #f8d7da;
+  border: 1px solid #f5c6cb;
+  border-radius: 4px;
+}
+
+.add-note-form__submit {
+  background-color: #007bff;
+  color: white;
+  border: none;
+  padding: 10px 20px;
+  font-size: 14px;
+  font-weight: 600;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.add-note-form__submit:hover:not(:disabled) {
+  background-color: #0056b3;
+}
+
+.add-note-form__submit:disabled {
+  background-color: #6c757d;
+  cursor: not-allowed;
+}
+
+.add-note-form__submit:focus {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(0, 123, 255, 0.5);
+}
