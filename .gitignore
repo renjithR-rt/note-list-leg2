@@ -20,3 +20,8 @@ __pycache__/
 output-archive/
 **/.mcp-config-resolved.json
 .mcp-config-resolved.json
+
+
+**/__pycache__/
+*.pyc
+*.pyo
