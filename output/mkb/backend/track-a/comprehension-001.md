@@ -1,10 +1,10 @@
-# Comprehension Report — MWU-NL2-001 Backend
+# Comprehension Report — MWU-NL2-001 Backend Module
 **Phase:** Comprehension — Track A (LLM Direct)
-**Date:** 2026-05-19
+**Date:** 2026-05-20
 **Analyst model:** claude-opus-4-6
-**Source:** discovery-001.md (4 source files, complexity LOW)
-**Rules extracted:** 8 business rules
-**MKB artifacts stored:** 8 UUIDs (pre-existing from 2026-05-18 session — verified, not duplicated)
+**Source:** discovery-001.md (3 source files, complexity LOW)
+**Rules extracted:** 9 business rules
+**MKB artifacts stored:** 9 UUIDs
 
 ---
 
@@ -12,91 +12,71 @@
 
 | ID | Description | Type | Source | Priority | Ambiguity | MKB UUID |
 |----|-------------|------|--------|----------|-----------|----------|
-| BR-BACKEND-001 | Notes with empty content (after trim) MUST NOT be saved. Whitespace-only content is treated as empty and rejected with "Note cannot be empty". Pydantic `field_validator` on `NoteCreate.content` — `raise ValueError` if `not v.strip()`. DB `NOT NULL` enforces non-null but not non-empty; application layer must enforce. | VALIDATION | `index.php:24-26` | HIGH | None | `0528c666-adea-4e83-b25c-26e856c7c9cf` |
-| BR-BACKEND-002 | Note content limited to 500 characters. `MAX_NOTE_LENGTH=500` matches DB `VARCHAR(500)`. PHP `strlen()` counts bytes; Python `len()` counts characters — limit semantics differ for multi-byte content. | VALIDATION | `index.php:4,27-29`; `schema.sql:6` | HIGH | **NEEDS_VALIDATION**: 500 bytes or 500 characters? Recommend character-length (Python default). | `34087b7b-b66e-40cd-96dd-442213445a31` |
-| BR-BACKEND-003 | Delete operations require a positive integer ID (`> 0`). IDs ≤ 0 rejected with "Invalid note ID". Non-integer values cast to 0 by PHP and therefore also rejected. FastAPI: `id: int = Path(..., gt=0)` + 422 for non-integer. | VALIDATION | `index.php:37-40` | HIGH | None | `1947fa5b-abfe-4cd9-b386-c7a597cb1a19` |
-| BR-BACKEND-004 | **CRITICAL — No authentication.** Zero auth, session management, or access control. All endpoints fully public by design. Do NOT add `Depends(get_current_user)`, OAuth2, JWT, or session middleware. | AUTHORIZATION | `index.php` (confirmed absence) | CRITICAL | None — deliberate design choice | `fd577753-026c-4151-a1d2-1f87e74fc483` |
-| BR-BACKEND-005 | Notes listed newest first: `ORDER BY created_at DESC`. Only supported sort order; no sort parameter accepted. | CONSTRAINT | `index.php:10-13` | MEDIUM | None | `6ac173aa-2ad5-4d17-adf1-f64efbf16179` |
-| BR-BACKEND-006 | Content is `trim()`-ed before validation and storage. Leading/trailing whitespace silently stripped. Empty check (BR-001) and length check (BR-002) operate on the trimmed value. Apply `strip()` in Pydantic `field_validator(mode='before')`. | TRANSFORMATION | `index.php:23` | MEDIUM | None | `09dbfde6-f2f6-4323-9717-941cf7944ff8` |
-| BR-BACKEND-007 | Legacy `delete_note()` returns `['ok' => true]` even when no row matched (silent success on non-existent ID). FastAPI SHOULD raise `HTTPException(404)` when `result.rowcount == 0` — correct REST behaviour. | WORKFLOW | `index.php:41-43` | HIGH | **NEEDS_VALIDATION**: Confirm 404 on missing delete is acceptable (behavioural change from legacy). | `3feb915f-7a1a-4841-9e16-7fe16de9724e` |
-| BR-BACKEND-008 | List endpoint returns all notes — no LIMIT, no OFFSET. Intentional for small data volume (< 1000 rows). Do NOT add pagination silently. | CONSTRAINT | `index.php:8-19` | LOW | None | `1414443f-545e-4e39-b78a-df085756454b` |
+| BR-BACKEND-001 | Note content must not be empty after whitespace trimming; reject with "Note cannot be empty" | VALIDATION | index.php:24-26 (add_note) | HIGH | None | 5dc47a89-e526-4e8a-8cff-da007e8414f3 |
+| BR-BACKEND-002 | Note content limited to 500 characters; reject with "Note too long (max 500 chars)"; enforced at app + DB layer | VALIDATION | index.php:27-29 (add_note), schema.sql:6 | HIGH | None | ed30de4a-afb7-46db-9c4d-9fe57d89eb16 |
+| BR-BACKEND-003 | Content whitespace trimmed BEFORE empty check and length check; trimmed value is what gets stored | TRANSFORMATION | index.php:23 (add_note) | MEDIUM | None | bdf7e274-1908-4c6e-837e-44b5d5ef6c0b |
+| BR-BACKEND-004 | Delete rejects non-positive integer IDs with "Invalid note ID"; cast-to-int then check > 0 | VALIDATION | index.php:37-40 (delete_note) | HIGH | None | 7c57efb3-3598-4f35-a48f-9172c2b8c0d7 |
+| BR-BACKEND-005 | Delete on valid but non-existent note ID must return 404 (GAP: legacy returns ok:true silently) | CONSTRAINT | index.php:35-43 (delete_note) | HIGH | **GAP REMEDIATION** — behaviour absent in legacy; required by stated business requirements | 4a307adb-489c-4995-9cfb-ae78aa51cefc |
+| BR-BACKEND-006 | All endpoints are public — NO authentication, authorization, sessions, or API keys | AUTHORIZATION | index.php (global) | CRITICAL | None — HARD CONSTRAINT: adding any auth violates source design | aaa8ab29-3087-4a03-abdb-762df15d52ce |
+| BR-BACKEND-007 | Notes always returned in descending creation order (newest first); no user-configurable sort | CONSTRAINT | index.php:11 (get_notes) | MEDIUM | None | e9e59b8a-f2f5-4951-95d6-0927ea85519d |
+| BR-BACKEND-008 | Content stored as UTF-8; PostgreSQL 4-byte UTF-8 upgrades MySQL 3-byte utf8 (emoji now supported) | CONSTRAINT | db.php:10, schema.sql:1 | LOW | None | 6dd458b9-3ff5-4be9-a05d-04e6755aac46 |
+| BR-BACKEND-009 | created_at set by DB via DEFAULT CURRENT_TIMESTAMP; app layer never supplies this value | CONSTRAINT | schema.sql:7 | LOW | None | 2af1953d-1ba6-4d63-b060-37111f3fe0d4 |
 
-### Rule Type Distribution
-- VALIDATION: 3 (BR-001, BR-002, BR-003)
-- AUTHORIZATION: 1 (BR-004)
-- CONSTRAINT: 2 (BR-005, BR-008)
-- TRANSFORMATION: 1 (BR-006)
-- WORKFLOW: 1 (BR-007)
+### Validation Chain (BR-003 → BR-001 → BR-002)
+
+The three validation BRs execute in strict order during note creation:
+1. **BR-003** — `strip()` whitespace from content
+2. **BR-001** — Reject if stripped content is empty
+3. **BR-002** — Reject if stripped content exceeds 500 chars
+
+This order MUST be preserved in the Pydantic validator. Reversing BR-001 and BR-003 would allow whitespace-only notes through.
 
 ---
 
 ## 2. Implementation Notes for CodeGen Agent
 
-### RISK-BACKEND-001: GLOBAL-VAR — Global database connection coupling
-**Severity:** HIGH
-**What to do:** Replace all `global $conn` usage with FastAPI `AsyncSession` dependency injection via `get_db()`.
-**Pattern to use:**
-```python
-async def list_notes(db: AsyncSession = Depends(get_db)) -> list[NoteRead]:
-    result = await db.execute(select(Note).order_by(Note.created_at.desc()))
-    return result.scalars().all()
-```
-**Do NOT:** Use module-level global session objects or singleton patterns.
-
-### RISK-BACKEND-002: RAW-SQL-CONCAT — SQL injection via string interpolation
-**Severity:** HIGH
-**What to do:** Use SQLAlchemy ORM queries exclusively. All user-supplied values MUST be parameterised.
-**Pattern to use:**
-```python
-stmt = insert(Note).values(content=content)
-result = await db.execute(stmt)
-```
-**Do NOT:** Use `text()` with string concatenation. Never interpolate user input into SQL strings.
-
-### RISK-BACKEND-003: DIRECT-OUTPUT — Business logic mixed with HTML
-**Severity:** MEDIUM
-**What to do:** Separate into Router (HTTP handling) → Service (business logic) → ORM (data access). Router returns JSON; no HTML rendering in backend MWU.
-**Pattern to use:** Three-layer architecture: `routers/notes.py` → `services/note_service.py` → `models/note.py`.
-**Do NOT:** Put business logic in route handlers. Do NOT generate HTML from the backend API.
-
-### RISK-BACKEND-004: DATE-INTERPOLATION — PHP date formatting in output
-**Severity:** MEDIUM
-**What to do:** Return `created_at` as ISO 8601 datetime from the API. Frontend formats for display.
-**Pattern to use:** Pydantic `NoteRead` model with `created_at: datetime` — serialises to ISO 8601 automatically.
-**Do NOT:** Format dates in the backend response. No `strftime()` in the router or service layer.
-
-### RISK-BACKEND-005: NULL-RETURN — Silent success on delete of non-existent ID
-**Severity:** MEDIUM
-**What to do:** After `DELETE`, check `result.rowcount`. If 0, raise `HTTPException(status_code=404, detail="Note not found")`. See BR-BACKEND-007 — pending product owner validation.
+### RISK-001: HIGH — Delete Silent No-Op on Missing Note
+**What to do:** After executing `DELETE FROM notes WHERE id = :note_id`, check `result.rowcount`. If `rowcount == 0`, raise `HTTPException(status_code=404, detail="Note not found")`.
 **Pattern to use:**
 ```python
 result = await db.execute(delete(Note).where(Note.id == note_id))
+await db.commit()
 if result.rowcount == 0:
     raise HTTPException(status_code=404, detail="Note not found")
-await db.commit()
 ```
-**Do NOT:** Silently return 200/204 when the target row doesn't exist.
+**Do NOT:** Return a success response when no rows were deleted (as PHP does).
 
-### RISK-BACKEND-006: DEPRECATED-EXT — `mysql_*` functions removed in PHP 7
-**Severity:** HIGH
-**What to do:** Replace entirely with SQLAlchemy 2.x async engine using `asyncpg` driver.
+### RISK-002: HIGH — SQL Injection via String Interpolation
+**What to do:** Use SQLAlchemy ORM methods or parameterized `select()`/`insert()`/`delete()` for all queries. Never concatenate user input into SQL strings.
+**Pattern to use:** `session.execute(insert(Note).values(content=content))` or equivalent ORM pattern.
+**Do NOT:** Use `text()` with f-strings or string formatting. No `f"SELECT ... WHERE id = {id}"`.
+
+### RISK-003: MEDIUM — Deprecated mysql_* API
+**What to do:** Already resolved by migration to SQLAlchemy 2.x async. No action needed beyond using the standard async session pattern.
+
+### RISK-004: MEDIUM — DELETE via HTTP GET
+**What to do:** Use `@router.delete("/api/notes/{note_id}")` — proper HTTP DELETE method.
+**Do NOT:** Accept GET requests for delete operations. No query parameter deletion (`?delete=id`).
+
+### RISK-005: MEDIUM — No PRG Pattern (Duplicate on Refresh)
+**What to do:** REST API + SPA frontend eliminates this. POST /api/notes returns JSON (201); frontend handles redirect/state update.
+**Do NOT:** Implement server-side redirects or PRG pattern — the SPA architecture makes it unnecessary.
+
+### RISK-006: MEDIUM — DATETIME to TIMESTAMP WITH TIME ZONE
+**What to do:** Use `DateTime(timezone=True)` in SQLAlchemy model with `server_default=func.now()`. All timestamps are timezone-aware in PostgreSQL.
+**Pattern to use:** `mapped_column(DateTime(timezone=True), server_default=func.now())`
+**Assumption:** Legacy data without timezone info is treated as UTC. Document this assumption in migration scripts.
+
+### RISK-007: LOW — MySQL utf8 3-byte Limitation
+**What to do:** No action needed. PostgreSQL UTF-8 is 4-byte natively. Emoji and supplementary Unicode characters now work automatically.
+
+### RISK-008: LOW — Hardcoded DB Credential Fallbacks
+**What to do:** Require `DATABASE_URL` environment variable. Fail hard with clear error if missing.
+**Do NOT:** Add hardcoded fallback credentials like `noteuser`/`notepass`. No default connection strings.
 **Pattern to use:**
 ```python
-engine = create_async_engine("postgresql+asyncpg://...", echo=False)
-async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+DATABASE_URL = os.environ["DATABASE_URL"]  # KeyError if missing = fail-fast
 ```
-**Do NOT:** Use synchronous SQLAlchemy or raw `psycopg2`.
-
-### RISK-BACKEND-007: STRLEN-MULTIBYTE — Byte-count vs character-count mismatch
-**Severity:** LOW
-**What to do:** Use Python `len()` (character-count) for the 500-character limit. This is the natural Python behaviour and likely the intended semantics. Pending product owner confirmation (BR-BACKEND-002).
-**Pattern to use:** `content: str = Field(..., max_length=500)` in Pydantic — character-length by default.
-**Do NOT:** Encode to UTF-8 and count bytes to replicate PHP `strlen()` behaviour — this would be a regression for multi-byte users.
-
-### RISK-BACKEND-008: NO-CSRF — No CSRF protection
-**Severity:** LOW
-**What to do:** No action required. FastAPI REST API with JSON body is not subject to browser CSRF when using fetch/XHR (no cookie-based auth exists per BR-BACKEND-004).
-**Do NOT:** Add CSRF middleware or tokens. No cookie auth will be added.
 
 ---
 
@@ -104,8 +84,9 @@ async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False
 
 | ID | Question | Discovery Source | Impact if Wrong |
 |----|----------|-----------------|-----------------|
-| BR-BACKEND-002 | Should the 500-character limit count characters (Python `len()`) or bytes (PHP `strlen()`)? Recommend characters. | `index.php:27`, R-007 | Multi-byte content (emoji, CJK) that fits in 500 characters but exceeds 500 bytes would be rejected if byte-counting is preserved. Low impact for English-only usage. |
-| BR-BACKEND-007 | Should DELETE on a non-existent note return 404 (correct REST) or 204 (legacy silent-success behaviour)? Recommend 404. | `index.php:41-43`, R-005 | If any consumer depends on silent success, switching to 404 is a breaking change. Low risk — no known API consumers exist for this single-user app. |
+| BR-BACKEND-005 | Should delete of non-existent note return 404 or 204? Discovery recommends 404 (gap remediation), but legacy silently succeeds. | index.php:35-43, RISK-001 | If 404: frontend must handle error state for stale delete buttons. If 204: simpler but hides bugs where frontend references deleted notes. |
+
+All other rules are unambiguous from source code inspection. BR-BACKEND-005 is flagged as MEDIUM confidence because the 404 behaviour is NEW — not observed in legacy, only recommended by discovery analysis.
 
 ---
 
@@ -115,52 +96,56 @@ async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False
 |-------|-----------|--------|--------|
 | — | — | — | — |
 
-**No cross-module dependencies.** This is a self-contained single-module application with no shared includes, sessions, or auth.
+No cross-module dependencies. The backend module is entirely self-contained. MWU-NL2-002-FE (frontend) **consumes** this module's 3 REST endpoints but the backend has no upstream dependencies.
+
+**Downstream consumers:**
+- MWU-NL2-002-FE depends on: `GET /api/notes`, `POST /api/notes`, `DELETE /api/notes/{id}`
 
 ---
 
 ## 5. MKB Storage Summary
 
-Total rules stored: 8
+Total rules stored: 9
+MKB project: NOTE-LIST-LEG2
 MKB module: backend
-Project ID: NOTE-LIST-2
+MKB namespace: business-rules
 Status: EXTRACTED (pending HITL validation)
-Storage date: 2026-05-18 (verified 2026-05-19 — all rules present, no duplicates)
-Cross-validation: 0 contradictions found
 
-| Rule ID | MKB UUID | Confidence |
-|---------|----------|------------|
-| BR-BACKEND-001 | `0528c666-adea-4e83-b25c-26e856c7c9cf` | HIGH |
-| BR-BACKEND-002 | `34087b7b-b66e-40cd-96dd-442213445a31` | HIGH |
-| BR-BACKEND-003 | `1947fa5b-abfe-4cd9-b386-c7a597cb1a19` | HIGH |
-| BR-BACKEND-004 | `fd577753-026c-4151-a1d2-1f87e74fc483` | HIGH |
-| BR-BACKEND-005 | `6ac173aa-2ad5-4d17-adf1-f64efbf16179` | HIGH |
-| BR-BACKEND-006 | `09dbfde6-f2f6-4323-9717-941cf7944ff8` | HIGH |
-| BR-BACKEND-007 | `3feb915f-7a1a-4841-9e16-7fe16de9724e` | MEDIUM |
-| BR-BACKEND-008 | `1414443f-545e-4e39-b78a-df085756454b` | HIGH |
+| Rule ID | MKB UUID |
+|---------|----------|
+| BR-BACKEND-001 | 5dc47a89-e526-4e8a-8cff-da007e8414f3 |
+| BR-BACKEND-002 | ed30de4a-afb7-46db-9c4d-9fe57d89eb16 |
+| BR-BACKEND-003 | bdf7e274-1908-4c6e-837e-44b5d5ef6c0b |
+| BR-BACKEND-004 | 7c57efb3-3598-4f35-a48f-9172c2b8c0d7 |
+| BR-BACKEND-005 | 4a307adb-489c-4995-9cfb-ae78aa51cefc |
+| BR-BACKEND-006 | aaa8ab29-3087-4a03-abdb-762df15d52ce |
+| BR-BACKEND-007 | e9e59b8a-f2f5-4951-95d6-0927ea85519d |
+| BR-BACKEND-008 | 6dd458b9-3ff5-4be9-a05d-04e6755aac46 |
+| BR-BACKEND-009 | 2af1953d-1ba6-4d63-b060-37111f3fe0d4 |
 
 To retrieve for CodeGen:
 ```
-mkb_get_business_rules(module="backend", status="VALIDATED", project_id="NOTE-LIST-2")
+mkb_get_business_rules(module="backend", status="VALIDATED", project_id="NOTE-LIST-LEG2")
 ```
 
 ---
 
 ## 6. Reviewer Checklist
 
-- [x] All 8 BRs from discovery Section 7 are captured
-- [x] Each BR has a clear, implementation-ready description
-- [x] All 8 risk register items from Section 8 are translated to CodeGen instructions
-- [x] Ambiguities flagged (BR-002 byte/char, BR-007 silent-success) — not silently assumed
-- [x] MKB UUIDs recorded for all 8 rules — traceability complete
-- [x] Cross-module dependencies identified (none — self-contained module)
-- [x] Cross-validation executed — 0 contradictions
-- [x] Pipeline lesson applied: verified MKB tools active and all BRs stored (not PENDING_MKB_WRITE)
+- [ ] All 9 BRs from discovery Section 7 are captured (001–009)
+- [ ] Each BR has a clear, implementation-ready description with Pydantic/SQLAlchemy patterns
+- [ ] All 8 risk register items (RISK-001 through RISK-008) are translated to CodeGen instructions in Section 2
+- [ ] BR-BACKEND-005 flagged as MEDIUM confidence (gap remediation, not observed in legacy)
+- [ ] BR-BACKEND-006 flagged as CRITICAL hard constraint (no auth)
+- [ ] All 9 MKB UUIDs recorded in Section 5 for traceability
+- [ ] Validation chain order documented (BR-003 → BR-001 → BR-002)
+- [ ] Cross-module dependency: none upstream; downstream consumer MWU-NL2-002-FE identified
+- [ ] Pipeline lesson applied: verified all 9 BRs actually stored to MKB (no PENDING_MKB_WRITE)
 
 ---
 
-## 7. Pipeline Lesson Applied
+## 7. Pipeline Lessons Applied
 
-**Lesson:** `bd5b94b1` — Comprehension agent must verify `--allowedTools` includes `mkb_store_artifact`. If comprehension doc shows `PENDING_MKB_WRITE`, BRs were never stored, causing codegen to hallucinate.
-
-**Action taken:** Queried `mkb_get_business_rules(module="backend")` — confirmed all 8 BRs are stored with valid UUIDs and non-pending status. No backfill needed.
+| Lesson | Similarity | Action Taken |
+|--------|-----------|--------------|
+| Comprehension agent must have --allowedTools active to store BRs | 0.37 | Verified: all 9 mkb_store_artifact calls returned valid UUIDs — no PENDING_MKB_WRITE entries |

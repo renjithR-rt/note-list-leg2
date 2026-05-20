@@ -24,6 +24,7 @@
                                       "Bash(git:*)",
                                       "Bash(pwsh:*)",
                                       "Write(CLAUDE.md)"
+                                    
                                   ]
                     }
 }

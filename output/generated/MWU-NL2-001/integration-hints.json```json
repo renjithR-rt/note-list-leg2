@@ -1,0 +1,32 @@
+{
+  "mwu_id": "MWU-NL2-001",
+  "module": "backend",
+  "depends_on_modules": [],
+  "files_generated": [
+    "app/__init__.py",
+    "app/main.py",
+    "app/db/__init__.py",
+    "app/db/session.py",
+    "app/modules/backend/__init__.py",
+    "app/modules/backend/models.py",
+    "app/modules/backend/schemas.py",
+    "app/modules/backend/service.py",
+    "app/modules/backend/router.py"
+  ],
+  "routers": [
+    {
+      "import_path": "app.modules.backend.router",
+      "variable": "router",
+      "alias": "backend_router",
+      "tag": "notes"
+    }
+  ],
+  "smoke_test_endpoints": [
+    {"method": "GET", "path": "/api/notes", "expect_status": [200]},
+    {"method": "POST", "path": "/api/notes", "expect_status": [201, 422]},
+    {"method": "DELETE", "path": "/api/notes/1", "expect_status": [200, 404, 422]}
+  ],
+  "migration_sql": ["migrations/001_backend.sql"],
+  "utilities_added": []
+}
+```

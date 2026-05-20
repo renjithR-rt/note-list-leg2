@@ -1,122 +1,190 @@
-# Discovery Document — MWU-NL2-001 Backend
-**Module:** backend  
-**Date:** 2026-05-19  
-**Agent:** Discovery Agent (Python/FastAPI Stack Layer)  
-**Status:** EXTRACTED  
-**Complexity:** LOW  
+# Discovery — MWU-NL2-001 — Backend Module
+
+**Date:** 2026-05-20
+**MWU:** MWU-NL2-001
+**Module:** backend
+**Analyst:** Discovery Agent
+**Stack:** PHP 5.6 / MySQL 5.7 → Python 3.12 / FastAPI 0.110 / SQLAlchemy 2.x / PostgreSQL 16 / Pydantic v2
+
+**Lessons Applied (STEP 0):**
+- Lesson (sim 0.43): SELF_REVIEW → HUMAN_REVIEW → TESTING transition required; never skip HUMAN_REVIEW state
+- Lesson (sim 0.42): Codegen aborts if BRs are missing — all 9 BRs stored to MKB before pipeline advances
+- Lesson (sim 0.34): MKB namespace vs module — following injected `module="backend"` per system prompt instruction
 
 ---
 
 ## 1. Source File Inventory
 
-| File | Lines | Role | Notes |
-|------|-------|------|-------|
-| `source/index.php` | 121 | Mixed: business logic + request handler + HTML renderer | Three BL functions, POST/GET handling, full page HTML output |
-| `source/db.php` | 11 | Database connection bootstrap | Deprecated `mysql_*` extension; env-var config with fallback defaults |
-| `source/db/schema.sql` | 8 | DDL — canonical schema | Single table `notes`; `VARCHAR(500) NOT NULL`; `DATETIME DEFAULT CURRENT_TIMESTAMP` |
-| `source/db/seed.sql` | 8 | Seed data | 5 sample notes; confirms content is free-text |
+| # | File | Lines | Purpose | Concerns |
+|---|------|-------|---------|----------|
+| 1 | `source/index.php` | 121 | Monolithic: business logic + HTTP handler + HTML template | Mixed concerns; `mysql_*` ext; global state |
+| 2 | `source/db.php` | 11 | Database connection bootstrap | Deprecated `mysql_connect`; env vars with hardcoded fallbacks |
+| 3 | `source/db/schema.sql` | 8 | DDL for `notes` table | `DATETIME` (not `TIMESTAMP`); charset `utf8` (not `utf8mb4`) |
+| 4 | `source/db/seed.sql` | 7 | 5 sample rows | Test/dev data only; not migrated to production |
+| 5 | `source/style.css` | 28 | CSS styles | Frontend only — out of scope for this MWU |
 
-**Scope Boundary:** Business logic and data access only. UI/HTML layer (lines 69–120 of index.php) is out of scope for this MWU — it belongs to MWU-NL2-002-FE.
+**Scope for this MWU:** `source/index.php` (business logic functions + request handling) and `source/db.php` + `source/db/schema.sql`.
+`style.css` is frontend scope (MWU-NL2-002-FE).
 
 ---
 
 ## 2. Database Schema
 
 ### Table: `notes`
-**Source:** `source/db/schema.sql:4-8`
 
-| Column | MySQL Type | Constraint | PG Target Type | Flags |
-|--------|-----------|------------|----------------|-------|
-| `id` | `INT` | `AUTO_INCREMENT PRIMARY KEY` | `SERIAL PRIMARY KEY` | — |
-| `content` | `VARCHAR(500)` | `NOT NULL` | `VARCHAR(500) NOT NULL` | DB-enforced length matches application constant `MAX_NOTE_LENGTH=500` |
-| `created_at` | `DATETIME` | `DEFAULT CURRENT_TIMESTAMP` | `TIMESTAMP WITH TIME ZONE DEFAULT now()` | **PG-NULL-DATE** N/A — no `0000-00-00` default used; safe migration |
+| Column | MySQL Type | Constraints | PG Target Type | Flags |
+|--------|-----------|-------------|----------------|-------|
+| `id` | `INT AUTO_INCREMENT` | PRIMARY KEY | `SERIAL PRIMARY KEY` (or `BIGSERIAL`) | — |
+| `content` | `VARCHAR(500)` | NOT NULL | `VARCHAR(500) NOT NULL` | Business rule: max 500 chars enforced at app layer too |
+| `created_at` | `DATETIME` | DEFAULT CURRENT_TIMESTAMP | `TIMESTAMP WITH TIME ZONE DEFAULT NOW()` | **PG-NULL-DATE** flag: MySQL default is safe (no 0000-00-00) but type upgrade required |
 
-**Engine:** InnoDB → no special PostgreSQL migration concern.  
-**Charset:** `utf8` (MySQL's 3-byte UTF-8) → PostgreSQL default `UTF8` (full 4-byte); emoji in notes will now be stored correctly.  
-**No foreign keys, no indexes beyond PK.**
+**Character set:** MySQL schema declares `utf8` (3-byte, no emoji support). PostgreSQL uses UTF-8 natively (4-byte, full emoji support). No collation issues expected for existing data.
+
+**Migration Notes:**
+- `INT AUTO_INCREMENT` → `SERIAL` (prefer `BIGSERIAL` for future-proofing against ID exhaustion)
+- `DATETIME` → `TIMESTAMP WITH TIME ZONE` — timezone-aware; seed data has no TZ info, assume UTC
+- `ENGINE=InnoDB` — not applicable in PostgreSQL; omit
+- No foreign keys, no secondary indexes beyond PK
+- No cascade rules needed (single table, no references)
 
 ---
 
 ## 3. Data Access Layer — Function Inventory
 
-### 3.1 `get_notes()` — `index.php:8-19`
-```
-SELECT id, content, created_at FROM notes ORDER BY created_at DESC
-```
-- Returns all notes as PHP associative array; newest first.
-- No pagination, no filtering.
-- **GLOBAL-VAR:** uses `global $conn` → migrate to FastAPI `AsyncSession` dependency injection.
-- **N+1-QUERY:** Not present — single bulk fetch.
+### 3.1 `get_notes()` — `index.php:8–19`
 
-**FastAPI target:** `GET /notes` → `List[NoteRead]`
+```php
+function get_notes() {
+    global $conn;
+    $result = mysql_query(
+        "SELECT id, content, created_at FROM notes ORDER BY created_at DESC",
+        $conn
+    );
+    $notes = array();
+    while ($row = mysql_fetch_assoc($result)) {
+        $notes[] = $row;
+    }
+    return $notes;
+}
+```
+
+| Attribute | Value |
+|-----------|-------|
+| SQL | `SELECT id, content, created_at FROM notes ORDER BY created_at DESC` |
+| Returns | Array of all notes, newest-first |
+| Error handling | None — `mysql_query` failure silently returns `false` |
+| Flags | **GLOBAL-VAR** (`global $conn`), no **N+1-QUERY** (single bulk SELECT) |
+
+**FastAPI target:** `GET /api/notes` → `NoteService.list_all(db)` → `SELECT * FROM notes ORDER BY created_at DESC`
 
 ---
 
-### 3.2 `add_note($content)` — `index.php:21-33`
-```
-INSERT INTO notes (content) VALUES ('{escaped}')
-```
-- Pre-validates: `trim()` → empty check → length check (> 500).
-- Escapes via `mysql_real_escape_string()` — **RAW-SQL-CONCAT** flag: still string-interpolated SQL.
-- Returns `['ok' => true, 'id' => mysql_insert_id()]` on success.
-- Returns `['ok' => false, 'err' => '...']` on validation failure.
-- **GLOBAL-VAR:** `global $conn`.
+### 3.2 `add_note($content)` — `index.php:21–33`
 
-**FastAPI target:** `POST /notes` body `NoteCreate` → `NoteRead`
+```php
+function add_note($content) {
+    global $conn;
+    $content = trim($content);
+    if (empty($content)) {
+        return array('ok' => false, 'err' => 'Note cannot be empty');
+    }
+    if (strlen($content) > MAX_NOTE_LENGTH) {
+        return array('ok' => false, 'err' => 'Note too long (max 500 chars)');
+    }
+    $safe = mysql_real_escape_string($content, $conn);
+    mysql_query("INSERT INTO notes (content) VALUES ('$safe')", $conn);
+    return array('ok' => true, 'id' => mysql_insert_id($conn));
+}
+```
+
+| Attribute | Value |
+|-----------|-------|
+| Validation order | `trim()` → empty check → length check (500 chars) |
+| SQL | `INSERT INTO notes (content) VALUES ('$safe')` |
+| Returns | `['ok' => true, 'id' => <new_id>]` on success; `['ok' => false, 'err' => '...']` on validation failure |
+| Flags | **GLOBAL-VAR**, **RAW-SQL-CONCAT** (string interpolation despite `mysql_real_escape_string`), **DIRECT-OUTPUT** (return dict consumed by controller) |
+
+**FastAPI target:** `POST /api/notes` → Pydantic `NoteCreate(content: str)` validates → `NoteService.create(db, content)` → parameterized INSERT → return `NoteRead`
 
 ---
 
-### 3.3 `delete_note($id)` — `index.php:35-43`
-```
-DELETE FROM notes WHERE id = {int_cast_id}
-```
-- Casts `$id` to `(int)`.
-- Guards: `$id <= 0` → returns `['ok' => false, 'err' => 'Invalid note ID']`.
-- Does **NOT** check whether the note exists before DELETE — returns `['ok' => true]` even when no row matched.
-- **GLOBAL-VAR:** `global $conn`.
-- **NULL-RETURN:** Silent success on missing ID is a logic gap → FastAPI must raise `HTTPException(404)` when `rowcount == 0`.
+### 3.3 `delete_note($id)` — `index.php:35–43`
 
-**FastAPI target:** `DELETE /notes/{id}` → `204 No Content` or `404`
+```php
+function delete_note($id) {
+    global $conn;
+    $id = (int)$id;
+    if ($id <= 0) {
+        return array('ok' => false, 'err' => 'Invalid note ID');
+    }
+    mysql_query("DELETE FROM notes WHERE id = $id", $conn);
+    return array('ok' => true);
+}
+```
+
+| Attribute | Value |
+|-----------|-------|
+| ID validation | Cast to int; rejects `<= 0` with "Invalid note ID" |
+| SQL | `DELETE FROM notes WHERE id = $id` (integer cast — injection-safe) |
+| Returns | `['ok' => true]` **even when no row matched** — silent no-op on missing IDs |
+| Flags | **NULL-RETURN** (no 404 signal on missing record), **GLOBAL-VAR** |
+
+**Critical Gap (RISK-001):** PHP returns `ok: true` when deleting a non-existent ID. The stated business requirement is "operations on non-existent note IDs return proper errors." FastAPI MUST check `rowcount` after DELETE and raise `HTTPException(status_code=404)` when 0 rows affected.
+
+**FastAPI target:** `DELETE /api/notes/{id}` → `NoteService.delete(db, id)` → raises 404 if 0 rows deleted → returns 204 No Content on success
 
 ---
 
-### 3.4 Database Connection — `db.php:1-11`
-- Uses deprecated `mysql_connect()` / `mysql_select_db()` — removed in PHP 7.
-- Credentials from env vars with hardcoded defaults: `localhost / noteuser / notepass / notelist`.
-- Sets `utf8` charset via `mysql_query("SET NAMES 'utf8'")`.
-- **GLOBAL-VAR:** `$conn` assigned at module scope, consumed via `global $conn` in every function.
+### 3.4 DB Connection — `db.php:1–11`
 
-**FastAPI target:** SQLAlchemy 2.x async engine → `AsyncSession` via `get_db()` dependency.
+| Attribute | Value |
+|-----------|-------|
+| Connection | `mysql_connect()` — removed in PHP 7+; deprecated in PHP 5.5 |
+| Credentials | `getenv()` with hardcoded fallbacks (`noteuser` / `notepass` / `notelist`) |
+| Charset | `SET NAMES 'utf8'` |
+| Error handling | `die()` on connection failure — hard crash, no recovery |
+| Flags | **GLOBAL-VAR** (`$conn` injected into every function), deprecated ext |
+
+**FastAPI target:** SQLAlchemy `async_sessionmaker` with `AsyncSession`; `get_db()` FastAPI dependency; connection string from `DATABASE_URL` env var (no hardcoded fallbacks)
 
 ---
 
 ## 4. UI / Controller Layer
 
-### Request Handling — `index.php:45-66` (OUT OF SCOPE for this MWU)
-| Trigger | Method | Handler |
-|---------|--------|---------|
-| Form submit | `POST` with `$_POST['content']` | `add_note()` |
-| Delete link | `GET` with `$_GET['delete']` | `delete_note()` |
+The PHP controller is embedded in `index.php:46–67`.
 
-- No routing framework — PHP single-file request dispatch.
-- No CSRF protection.
-- Error/success stored in `$error` / `$success` variables, rendered inline.
+| Route | Method | Parameters | Handler | Issues |
+|-------|--------|-----------|---------|--------|
+| `/` | `POST` | `$_POST['content']` | `add_note()` | No PRG — re-POST on refresh duplicates notes |
+| `/` | `GET` | `$_GET['delete']` | `delete_note()` | DELETE via HTTP GET violates REST; CSRF-vulnerable |
+| `/` | `GET` | _(none)_ | `get_notes()` | Loads all notes — no pagination |
 
-### HTML Output — `index.php:69-120` (OUT OF SCOPE for this MWU)
-- Full page render: navbar, form, note list, footer.
-- **DIRECT-OUTPUT:** `echo` / `<?= ?>` in business logic file → separate completely in FastAPI.
-- **DATE-INTERPOLATION:** `date('d M Y', strtotime($n['created_at']))` — display formatting only; backend should return ISO 8601 datetime and let frontend format.
-- `htmlspecialchars()` used throughout for XSS prevention — Pydantic models provide equivalent protection.
+**Issues flagged:**
+- **No PRG pattern** (`index.php:50–57`): browser refresh after POST re-submits form; duplicates note
+- **DELETE via GET** (`index.php:59–63`): violates HTTP semantics; any `<img src="/?delete=1">` silently deletes
+- **No CSRF protection**: form at `index.php:92` has no token field
+- **No pagination**: `get_notes()` always returns all rows; potential performance issue at scale
+
+**FastAPI migration eliminates all of these** via proper REST endpoints and JSON API.
 
 ---
 
 ## 5. List / Search / Inquiry Pages
 
-| Page/Feature | Source Location | Query | Sort | Pagination | Filter |
-|-------------|----------------|-------|------|------------|--------|
-| Note list | `index.php:8-19` | `SELECT id, content, created_at FROM notes` | `created_at DESC` | None — full table scan | None |
+| Page | Legacy Path | Data Source | Columns Displayed | Sort | Filter | Pagination |
+|------|-------------|-------------|-------------------|------|--------|-----------|
+| Note List | `/` (`index.php`) | `notes` table | `id` (implicit), `content`, `created_at` | `created_at DESC` | None | None |
 
-No search, no filtering, no pagination in legacy. Migration scope: replicate exact behaviour; pagination is a future enhancement, NOT in scope.
+**Display logic (template layer, `index.php:101–115`):**
+- Empty state: "No notes yet. Add one above."
+- Date format: `date('d M Y', strtotime($n['created_at']))` — e.g. "20 May 2026" — **DATE-INTERPOLATION** flag
+- Content escaping: `htmlspecialchars()` applied on output (correct XSS defense)
+- Delete: `href="?delete={id}"` with JS `confirm()` dialog
+
+**Migration notes:**
+- Date formatting (`d M Y`) is UI concern → frontend formats `created_at` ISO 8601 string
+- `htmlspecialchars` escaping is frontend concern → React handles XSS natively
+- No search, filter, or sort controls exist in legacy
 
 ---
 
@@ -124,196 +192,153 @@ No search, no filtering, no pagination in legacy. Migration scope: replicate exa
 
 ```
 index.php
-├── requires db.php              (database connection bootstrap)
-│   └── mysql_connect()          (deprecated PHP mysql extension)
-├── define('MAX_NOTE_LENGTH')    (application constant)
-├── get_notes()                  (data access — read)
-├── add_note()                   (data access — write)
-└── delete_note()                (data access — delete)
+  ├── db.php                     (DB connection bootstrap: $conn global)
+  │     └── mysql_connect()      (PHP ext, deprecated/removed)
+  ├── get_notes()                → SELECT id, content, created_at FROM notes
+  ├── add_note($content)         → INSERT INTO notes (content)
+  └── delete_note($id)           → DELETE FROM notes WHERE id = $id
 
-FastAPI target graph:
-app/
-├── routers/notes.py             ← replaces request handling in index.php
-├── services/note_service.py     ← replaces get_notes / add_note / delete_note
-├── models/note.py               ← SQLAlchemy ORM (notes table)
-├── schemas/note.py              ← Pydantic NoteCreate / NoteRead
-└── core/database.py             ← replaces db.php (async engine + get_db)
+External dependencies:
+  MySQL 5.7 @ localhost:3310/notelist
+  PHP 5.6 (mysql_* extension)
+
+No external HTTP calls
+No session management
+No authentication
+No file I/O
+No caching layer
+No queues or background jobs
 ```
 
-**Cross-module dependencies:** None. This is a self-contained single-module application.  
-**External services:** MySQL 5.7 → PostgreSQL 16.  
-**No shared includes, no session, no auth.**
+**Cross-module dependencies:** None. This module is entirely self-contained.
+
+**MWU-NL2-002-FE consumes** 3 REST endpoints produced by this MWU:
+- `GET  /api/notes`
+- `POST /api/notes`
+- `DELETE /api/notes/{id}`
 
 ---
 
-## 7. Business Rules
+## 7. Business Rules (Exhaustive)
 
-> All rules below apply to module `backend`. Rules marked `NEEDS_VALIDATION` require product owner confirmation before implementation.
-
-| Rule ID | Category | Priority | Confidence | Status | Source |
-|---------|----------|----------|------------|--------|--------|
-| BR-BACKEND-001 | VALIDATION_RULE | HIGH | HIGH | NEEDS_VALIDATION | `index.php:24-26` |
-| BR-BACKEND-002 | VALIDATION_RULE | HIGH | HIGH | NEEDS_VALIDATION | `index.php:27-29` |
-| BR-BACKEND-003 | ID_VALIDATION | HIGH | HIGH | NEEDS_VALIDATION | `index.php:37-40` |
-| BR-BACKEND-004 | ANY_AUTH_PATTERN | CRITICAL | HIGH | NEEDS_VALIDATION | `index.php` (absence) |
-| BR-BACKEND-005 | SORT_ORDER | MEDIUM | HIGH | EXTRACTED | `index.php:10-13` |
-| BR-BACKEND-006 | INPUT_NORMALIZATION | MEDIUM | HIGH | EXTRACTED | `index.php:23` |
-| BR-BACKEND-007 | ID_VALIDATION | HIGH | MEDIUM | NEEDS_VALIDATION | `index.php:41-43` |
-| BR-BACKEND-008 | DATA_VOLUME | LOW | HIGH | EXTRACTED | `index.php:8-19` |
+### BR-BACKEND-001 — Empty Note Guard
+**Source:** `index.php:24–26`
+**Rule:** A note cannot be saved if its content is empty after whitespace trimming.
+**Logic:** `trim($content)` → `empty($content)` → reject with "Note cannot be empty"
+**Error message:** "Note cannot be empty"
+**Priority:** HIGH | **Status:** NEEDS_VALIDATION
+**FastAPI impl:** Pydantic `@field_validator('content')` raises `ValueError('Note cannot be empty')` if `content.strip() == ""`
 
 ---
 
-### BR-BACKEND-001: Empty Note Rejection
-**Category:** VALIDATION_RULE  
-**Priority:** HIGH — NEEDS_VALIDATION  
-**Source:** `index.php:24-26`
-
-Notes with empty content (after trim) MUST NOT be saved. The check occurs after `trim()`, so a note containing only whitespace is treated as empty.
-
-```php
-$content = trim($content);
-if (empty($content)) {
-    return array('ok' => false, 'err' => 'Note cannot be empty');
-}
-```
-
-**FastAPI implementation:** Pydantic validator on `NoteCreate.content` — `@field_validator('content') ... if not v.strip(): raise ValueError('Note cannot be empty')`.  
-**PostgreSQL:** `content VARCHAR(500) NOT NULL` enforces non-null but not non-empty — application layer must enforce blank check.
+### BR-BACKEND-002 — Note Length Limit (500 chars)
+**Source:** `index.php:27–29`, `db/schema.sql:6`
+**Rule:** Note content is limited to 500 characters. Enforced at application layer; also enforced as DB column width.
+**Logic:** `strlen($content) > 500` → reject with "Note too long (max 500 chars)"
+**Constant:** `MAX_NOTE_LENGTH = 500` (`index.php:4`)
+**Error message:** "Note too long (max 500 chars)"
+**Priority:** HIGH | **Status:** NEEDS_VALIDATION
+**FastAPI impl:** Pydantic `Field(max_length=500)` + ORM `String(500)` column
 
 ---
 
-### BR-BACKEND-002: Maximum Note Length 500 Characters
-**Category:** VALIDATION_RULE  
-**Priority:** HIGH — NEEDS_VALIDATION  
-**Source:** `index.php:4, 27-29`; `source/db/schema.sql:6`
-
-Note content is limited to 500 characters. The application constant `MAX_NOTE_LENGTH = 500` matches the DB column `VARCHAR(500)`.
-
-```php
-if (strlen($content) > MAX_NOTE_LENGTH) {
-    return array('ok' => false, 'err' => 'Note too long (max 500 chars)');
-}
-```
-
-**Important:** `strlen()` counts bytes; multi-byte UTF-8 characters (emoji, CJK) count as multiple bytes. Target PostgreSQL uses character-length semantics. **NEEDS_VALIDATION:** should limit be 500 characters or 500 bytes?
-
-**FastAPI implementation:** `content: str = Field(..., max_length=500)` in `NoteCreate` (character-length).
-
----
-
-### BR-BACKEND-003: Delete Requires Valid Positive Integer ID
-**Category:** ID_VALIDATION  
-**Priority:** HIGH — NEEDS_VALIDATION  
-**Source:** `index.php:37-40`
-
-Delete operations must validate that the ID is a positive integer (`> 0`). IDs ≤ 0 are rejected with an error.
-
-```php
-$id = (int)$id;
-if ($id <= 0) {
-    return array('ok' => false, 'err' => 'Invalid note ID');
-}
-```
-
-**FastAPI implementation:** FastAPI path parameter `id: int` with `gt=0` constraint handles this automatically via Pydantic. Non-integer IDs return `422 Unprocessable Entity`.
-
----
-
-### BR-BACKEND-004: No Authentication — All Endpoints Are Public
-**Category:** ANY_AUTH_PATTERN  
-**Priority:** CRITICAL — NEEDS_VALIDATION  
-**Source:** `index.php` (confirmed absence of any auth check)
-
-The legacy application has zero authentication, session management, or access control. All note operations (list, create, delete) are fully public. This is a deliberate design choice — **do NOT add authentication** in the FastAPI migration.
-
-**FastAPI implementation:** No `Depends(get_current_user)` anywhere. No OAuth2, JWT, or session middleware.
-
----
-
-### BR-BACKEND-005: Notes Listed Newest First
-**Category:** SORT_ORDER  
-**Priority:** MEDIUM  
-**Source:** `index.php:10-13`
-
-All note listings are ordered by `created_at DESC` — the newest note appears at the top.
-
-```php
-"SELECT id, content, created_at FROM notes ORDER BY created_at DESC"
-```
-
-**FastAPI implementation:** `ORDER BY created_at DESC` in the ORM query.
-
----
-
-### BR-BACKEND-006: Content Is Trimmed Before Validation and Storage
-**Category:** INPUT_NORMALIZATION  
-**Priority:** MEDIUM  
+### BR-BACKEND-003 — Content Trimming Before Validation
 **Source:** `index.php:23`
-
-Note content is `trim()`-ed before any validation or database write. This means leading/trailing whitespace is silently stripped.
-
-```php
-$content = trim($content);
-```
-
-**FastAPI implementation:** `@field_validator('content', mode='before') def strip_content(cls, v): return v.strip()` — apply before the empty check.
+**Rule:** Content whitespace is trimmed BEFORE the empty check and length check. The trimmed value is what gets stored.
+**Logic:** `$content = trim($content)` executed before any validation check
+**Priority:** MEDIUM | **Status:** NEEDS_VALIDATION
+**FastAPI impl:** Pydantic validator applies `.strip()` before validation; stripped value stored to DB
 
 ---
 
-### BR-BACKEND-007: Delete on Non-Existent Note Returns Silent Success
-**Category:** ID_VALIDATION  
-**Priority:** HIGH — NEEDS_VALIDATION  
-**Source:** `index.php:41-43`  
-**Confidence:** MEDIUM (behaviour is implicit, not documented)
-
-The legacy `delete_note()` executes `DELETE WHERE id = $id` and returns `['ok' => true]` regardless of whether any row was affected. A delete of a non-existent ID silently succeeds.
-
-**Migration decision required:** The FastAPI implementation SHOULD raise `HTTPException(status_code=404, detail="Note not found")` when `result.rowcount == 0`, as this is the correct REST behaviour. However, if any consumer relies on the silent-success behaviour, this is a breaking change.
-
-**Marked NEEDS_VALIDATION** — confirm with product owner that 404 on missing delete is acceptable.
+### BR-BACKEND-004 — Invalid ID Guard (Non-positive Integer)
+**Source:** `index.php:37–40`
+**Rule:** Delete operations must reject IDs that are zero or negative.
+**Logic:** `$id = (int)$id; if ($id <= 0) return error`
+**Error message:** "Invalid note ID"
+**Priority:** HIGH | **Status:** NEEDS_VALIDATION
+**FastAPI impl:** Path parameter `note_id: int = Path(ge=1)` → 422 Unprocessable Entity on invalid; no service call made
 
 ---
 
-### BR-BACKEND-008: No Pagination — Full Table Returned
-**Category:** DATA_VOLUME  
-**Priority:** LOW  
-**Source:** `index.php:8-19`
+### BR-BACKEND-005 — Missing Note Returns Error (404) — NEEDS_VALIDATION
+**Source:** `index.php:35–43` — **GAP: this behaviour is ABSENT in legacy code**
+**Rule:** Delete operations on a valid but non-existent note ID must return a not-found error.
+**Gap:** Current PHP returns `ok: true` silently when 0 rows are deleted.
+**Priority:** HIGH | **Status:** NEEDS_VALIDATION
+**Recommendation:** FastAPI checks `result.rowcount` after DELETE; raises `HTTPException(status_code=404, detail="Note not found")` when 0 rows affected.
 
-The list endpoint returns all notes in a single query with no limit or offset. This is intentional for a personal note-taking app with small data volume.
+---
 
-**FastAPI implementation:** Replicate exact behaviour. Do NOT add pagination silently. Future enhancement if needed.
+### BR-BACKEND-006 — No Authentication (Public API)
+**Source:** `index.php` — no session, no login, no access control anywhere
+**Rule:** All note endpoints are public. No authentication is required and NONE must be added.
+**CRITICAL:** Adding any auth layer violates this rule.
+**Priority:** CRITICAL | **Status:** NEEDS_VALIDATION
+**FastAPI impl:** No `Depends(get_current_user)`. No auth middleware. No API keys. Document explicitly in router.
+
+---
+
+### BR-BACKEND-007 — Note Ordering (Newest First)
+**Source:** `index.php:11`
+**Rule:** Notes are always returned in descending creation order (newest first).
+**Logic:** `ORDER BY created_at DESC`
+**Priority:** MEDIUM | **Status:** NEEDS_VALIDATION
+**FastAPI impl:** SQLAlchemy `.order_by(Note.created_at.desc())` in list query
+
+---
+
+### BR-BACKEND-008 — UTF-8 Storage
+**Source:** `db.php:10`, `db/schema.sql:1`
+**Rule:** Note content is stored and retrieved as UTF-8.
+**Logic:** `mysql_query("SET NAMES 'utf8'")` + schema `DEFAULT CHARACTER SET utf8`
+**Note:** MySQL `utf8` is 3-byte (no emoji). PostgreSQL UTF-8 is 4-byte — an upgrade.
+**Priority:** LOW | **Status:** NEEDS_VALIDATION
+**FastAPI impl:** PostgreSQL uses UTF-8 natively; specify `client_encoding=utf8` in connection string
+
+---
+
+### BR-BACKEND-009 — Created-At Timestamp Auto-Set by Database
+**Source:** `db/schema.sql:7`
+**Rule:** `created_at` is set automatically by the database on INSERT. The application layer does not supply this value.
+**Logic:** `DEFAULT CURRENT_TIMESTAMP` — never set in `add_note()`
+**Priority:** LOW | **Status:** NEEDS_VALIDATION
+**FastAPI impl:** SQLAlchemy `Column(DateTime(timezone=True), server_default=func.now())`; no app-layer assignment in `NoteCreate` schema
 
 ---
 
 ## 8. Risk Register
 
-| ID | Flag | Location | Severity | Description | FastAPI Mitigation |
-|----|------|----------|----------|-------------|-------------------|
-| R-001 | **GLOBAL-VAR** | `index.php:9,22,36` | HIGH | `global $conn` couples all functions to module-level state | FastAPI `get_db()` `AsyncSession` dependency injection |
-| R-002 | **RAW-SQL-CONCAT** | `index.php:30-31` | HIGH | `mysql_real_escape_string` + string concat — SQL injection risk even with escaping | SQLAlchemy parameterised ORM queries eliminate entirely |
-| R-003 | **DIRECT-OUTPUT** | `index.php:69-120` | MEDIUM | HTML mixed with business logic in same file | Router + Service layer separation; Jinja2 or React handles render |
-| R-004 | **DATE-INTERPOLATION** | `index.php:108` | MEDIUM | `date('d M Y', strtotime($n['created_at']))` — PHP date formatting in output | Return ISO 8601 from API; frontend formats for display |
-| R-005 | **NULL-RETURN** | `index.php:41-43` | MEDIUM | `delete_note` silently succeeds for non-existent IDs | Check `rowcount`; raise `HTTPException(404)` — see BR-BACKEND-007 |
-| R-006 | **DEPRECATED-EXT** | `db.php:7-9` | HIGH | `mysql_connect()` removed in PHP 7; `mysql_*` functions deprecated since PHP 5.5 | Replace entirely with SQLAlchemy 2.x async engine |
-| R-007 | **STRLEN-MULTIBYTE** | `index.php:27` | LOW | `strlen()` counts bytes not characters; 500-byte limit may reject valid multi-byte content | Use `len()` (character-count) in Python — verify intent with product owner |
-| R-008 | **NO-CSRF** | `index.php:50-57` | LOW | POST form has no CSRF token — acceptable for single-user local app | FastAPI REST API with JSON body is not subject to CSRF in same way; no action needed unless cookie auth is added (it won't be, per BR-BACKEND-004) |
+| ID | Risk | Severity | Source Location | Migration Action |
+|----|------|----------|-----------------|-----------------|
+| RISK-001 | `delete_note` silent no-op — returns `ok:true` when note ID not found | HIGH | `index.php:35–43` | FastAPI must check `rowcount` after DELETE → raise 404 if 0 rows affected |
+| RISK-002 | SQL injection via string interpolation despite `mysql_real_escape_string` | HIGH | `index.php:30–31` | Replace with SQLAlchemy parameterized ORM insert |
+| RISK-003 | `mysql_*` deprecated API — removed in PHP 7 | MEDIUM | `index.php`, `db.php` | Already resolved by migration to SQLAlchemy |
+| RISK-004 | DELETE via HTTP GET — CSRF-vulnerable, violates REST semantics | MEDIUM | `index.php:59–63` | FastAPI uses `DELETE /api/notes/{id}` — correct HTTP method |
+| RISK-005 | No PRG pattern — form re-submit on browser refresh duplicates notes | MEDIUM | `index.php:50–57` | FastAPI REST + SPA frontend eliminates this |
+| RISK-006 | `DATETIME` → `TIMESTAMP WITH TIME ZONE` migration — timezone assumption | MEDIUM | `db/schema.sql:7` | Seed data has no TZ; assume UTC; document assumption for operators |
+| RISK-007 | MySQL `utf8` is 3-byte; emoji/4-byte chars fail silently | LOW | `db.php:10`, `schema.sql:1` | PostgreSQL UTF-8 is 4-byte; full emoji support; no action needed |
+| RISK-008 | Hardcoded DB credentials as env var fallbacks | LOW | `db.php:3–5` | Remove fallbacks; require `DATABASE_URL` env var; fail hard on missing |
 
 ---
 
 ## 9. Semgrep Pre-Analysis Confirmation
 
-The following patterns were identified during manual review that a Semgrep scan should confirm:
+Semgrep patterns checked against all source files:
 
-| Rule | Pattern | File | Line |
-|------|---------|------|------|
-| `php.lang.security.injection.tainted-sql-string` | `mysql_query("...('$safe')")` | `index.php` | 31 |
-| `php.lang.security.injection.tainted-sql-string` | `mysql_query("DELETE ... WHERE id = $id")` | `index.php` | 41 |
-| `php.lang.deprecated.deprecated-mysql-extension` | `mysql_connect`, `mysql_query`, `mysql_real_escape_string` | `db.php`, `index.php` | multiple |
-| `php.lang.maintainability.global-variable` | `global $conn` | `index.php` | 9, 22, 36 |
-| `php.lang.security.xss.echo-unescaped` | Any `echo` / `<?=` — all use `htmlspecialchars()` | `index.php` | 85, 88, 96, 107, 108 |
+| Pattern | Flag | File | Line(s) | Finding |
+|---------|------|------|---------|---------|
+| `mysql_query` (deprecated ext) | — | `index.php` | 10, 31, 41 | **CONFIRMED** — 3 occurrences |
+| `mysql_connect` (deprecated ext) | — | `db.php` | 7 | **CONFIRMED** |
+| `global $var` (global state) | **GLOBAL-VAR** | `index.php` | 9, 22, 36 | **CONFIRMED** — all 3 functions use `global $conn` |
+| SQL string concatenation/interpolation | **RAW-SQL-CONCAT** | `index.php` | 31 | **CONFIRMED** — `"INSERT INTO notes (content) VALUES ('$safe')"` |
+| `echo`/HTML direct output in logic file | **DIRECT-OUTPUT** | `index.php` | 69+ | **CONFIRMED** — PHP template tags mixed with business logic |
+| No CSRF token in form | — | `index.php` | 92 | **CONFIRMED** — form has no hidden token field |
+| `die()` on error | **NULL-RETURN** | `db.php` | 8, 9 | **CONFIRMED** — hard crash on DB connection failure |
+| Unvalidated GET parameter | — | `index.php` | 60 | **CONFIRMED** — `$_GET['delete']` cast to int only (safe for SQL, not for UX) |
+| Date string manipulation | **DATE-INTERPOLATION** | `index.php` | 108 | **CONFIRMED** — `date('d M Y', strtotime($n['created_at']))` |
 
-**All `echo` outputs confirmed to use `htmlspecialchars()` — XSS risk is mitigated in legacy code.**  
-No raw `$_POST` or `$_GET` values reach SQL directly (ID is cast to int; content uses escape).
+**Semgrep verdict:** 9 patterns flagged. All are expected PHP 5.6-era patterns. No novel vulnerabilities beyond known migration scope. The integer cast on `$_GET['delete']` is sufficient SQL protection but the missing 404 check (RISK-001) remains a logic gap.
 
 ---
 
@@ -323,64 +348,78 @@ No raw `$_POST` or `$_GET` values reach SQL directly (ID is cast to int; content
 
 | Dimension | Score | Rationale |
 |-----------|-------|-----------|
-| Schema complexity | LOW | Single table, no FKs, no indexes beyond PK |
-| Business rule count | LOW | 8 rules, all straightforward |
-| Data volume risk | LOW | Personal app — expected < 1000 rows |
-| Integration complexity | LOW | No external services, no auth, no sessions |
-| SQL complexity | LOW | 3 queries: SELECT all, INSERT, DELETE by ID |
-| State management | LOW | No sessions, no caching, no transactions needed |
-| Type mapping risk | LOW-MEDIUM | `strlen` bytes vs characters (R-007); `DATETIME` → `TIMESTAMP WITH TIME ZONE` |
+| Business logic | LOW | 3 functions, trivial CRUD, no domain complexity |
+| Data model | LOW | 1 table, 3 columns, no FKs, no secondary indexes |
+| SQL complexity | LOW | 1 SELECT, 1 INSERT, 1 DELETE — no joins, no subqueries |
+| Authentication / security | LOW | No auth required by design — simplifies FastAPI |
+| External integrations | TRIVIAL | No HTTP calls, no queues, no caches, no file I/O |
+| PHP anti-patterns to resolve | MEDIUM | `global $conn`, deprecated `mysql_*`, SQL concat, no PRG, DELETE via GET |
+| Gap remediation required | MEDIUM | RISK-001 (missing 404 on delete) requires new logic not in legacy |
 
-**Estimated FastAPI endpoint count:** 3  
-- `GET /notes` — list all notes
-- `POST /notes` — create note
-- `DELETE /notes/{id}` — delete note
-
-**Estimated Pydantic model count:** 2  
-- `NoteCreate` — input validation (content, max_length=500, strip)
-- `NoteRead` — response shape (id, content, created_at as ISO 8601)
-
----
-
-## 11. FastAPI Migration Sketch
+**FastAPI Migration Sketch:**
 
 ```
-Router:   app/routers/notes.py — 3 endpoints
-          GET    /notes           → List[NoteRead]
-          POST   /notes           → NoteRead (201 Created)
-          DELETE /notes/{id}      → 204 No Content | 404 Not Found
+Router:  app/api/notes.py — 3 endpoints
+  GET    /api/notes          → list_notes()      → 200 list[NoteRead]
+  POST   /api/notes          → create_note()     → 201 NoteRead
+  DELETE /api/notes/{id}     → delete_note()     → 204 No Content | 404
 
-Schemas:  app/schemas/note.py
-          NoteCreate  — content: str (stripped, min_length=1, max_length=500)
-          NoteRead    — id: int, content: str, created_at: datetime
+Schemas (Pydantic v2):  app/schemas/note.py
+  NoteCreate(content: str)
+    @field_validator('content') → strip + validate empty + max 500
+  NoteRead(id: int, content: str, created_at: datetime)
+    model_config = ConfigDict(from_attributes=True)
 
 Service:  app/services/note_service.py — NoteService
-          list_notes()              → list[Note]
-          create_note(content: str) → Note
-          delete_note(note_id: int) → None (raises 404 if not found)
+  .list_all(db: AsyncSession) -> list[Note]
+      SELECT * FROM notes ORDER BY created_at DESC
+  .create(db: AsyncSession, content: str) -> Note
+      INSERT INTO notes (content) VALUES (:content) RETURNING *
+  .delete(db: AsyncSession, note_id: int) -> None
+      DELETE FROM notes WHERE id = :note_id
+      if result.rowcount == 0: raise HTTPException(404, "Note not found")
 
-ORM:      app/models/note.py
-          class Note(Base):
-              __tablename__ = "notes"
-              id         = Column(Integer, primary_key=True, autoincrement=True)
-              content    = Column(String(500), nullable=False)
-              created_at = Column(DateTime(timezone=True), server_default=func.now())
+ORM Models:  app/models/note.py
+  class Note(Base):
+      __tablename__ = "notes"
+      id:         Mapped[int]      = mapped_column(primary_key=True)
+      content:    Mapped[str]      = mapped_column(String(500), nullable=False)
+      created_at: Mapped[datetime] = mapped_column(
+                      DateTime(timezone=True), server_default=func.now()
+                  )
 
-DB:       app/core/database.py
-          Async SQLAlchemy engine → postgresql+asyncpg://...
-          get_db() → AsyncGenerator[AsyncSession, None]
+Dependencies:  app/database.py
+  async_sessionmaker → AsyncSession
+  get_db() → AsyncGenerator[AsyncSession, None]
 
-Stubs:    None — no cross-module dependencies
+Entry:  app/main.py
+  FastAPI(title="Note List API")
+  app.include_router(notes_router, prefix="/api")
 ```
+
+**Estimated implementation scope:**
+- ~150 lines across 4 source files (excluding tests)
+- ~12 test cases minimum (3 endpoints × 4 scenarios: happy path, empty, too-long, missing-id)
 
 ---
 
-## 12. Files Written
+## 11. Files Written
 
-| File | Purpose |
-|------|---------|
-| `output/mkb/backend/track-a/discovery-001.md` | This document — pipeline handoff artifact |
+| # | Artifact | Location | Status |
+|---|----------|----------|--------|
+| 1 | Discovery document | `output/mkb/backend/track-a/discovery-001.md` | WRITTEN |
+| 2 | `discovery_finding` — backend module | MKB PostgreSQL (via `mkb_store_artifact`) | STORED |
+| 3 | `BR-BACKEND-001` — Empty Note Guard | MKB PostgreSQL | STORED |
+| 4 | `BR-BACKEND-002` — Note Length Limit | MKB PostgreSQL | STORED |
+| 5 | `BR-BACKEND-003` — Content Trimming | MKB PostgreSQL | STORED |
+| 6 | `BR-BACKEND-004` — Invalid ID Guard | MKB PostgreSQL | STORED |
+| 7 | `BR-BACKEND-005` — Missing Note 404 | MKB PostgreSQL | STORED |
+| 8 | `BR-BACKEND-006` — No Authentication | MKB PostgreSQL | STORED |
+| 9 | `BR-BACKEND-007` — Note Ordering | MKB PostgreSQL | STORED |
+| 10 | `BR-BACKEND-008` — UTF-8 Storage | MKB PostgreSQL | STORED |
+| 11 | `BR-BACKEND-009` — Created-At Auto-Set | MKB PostgreSQL | STORED |
 
-**MKB Storage:** Stored via `mkb_store_artifact` (artifact_type=`discovery_finding`, module=`backend`, project_id=`NOTE-LIST-2`)  
-**Business Rules stored:** BR-BACKEND-001 through BR-BACKEND-008  
-**Cross-validation:** Executed post-storage
+---
+
+**Pipeline handoff:** This document satisfies the DISCOVERY phase gate for MWU-NL2-001.
+Next phase: COMPREHENSION → PLANNING → CODEGEN.
