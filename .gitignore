@@ -2,21 +2,12 @@
 __pycache__/
 *.pyc
 .venv/
-output/backend/
-output/frontend/
 output/generated/
 output/pipeline-runs/
 *.log
 
-__pycache__/
-*.pyc
 *.pyo
-
-.env.secrets
 *.secrets
-__pycache__/
-*.pyc
-
 output-archive/
 **/.mcp-config-resolved.json
 .mcp-config-resolved.json
