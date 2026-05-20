@@ -16,3 +16,5 @@ output-archive/
 **/__pycache__/
 *.pyc
 *.pyo
+*.pyc
+ 

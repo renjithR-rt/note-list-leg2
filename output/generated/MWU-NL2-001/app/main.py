@@ -32,3 +32,7 @@ app = FastAPI(
 
 # BR-006: no auth router, no middleware for auth/sessions/API keys
 app.include_router(router)
+
+@app.get('/health')
+def health() -> dict:
+    return {'status': 'ok'}
