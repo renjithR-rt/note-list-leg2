@@ -1,864 +1,757 @@
-# Planning Document — MWU-NL2-001 Backend Module
+# Planning Document — MWU-NL2-001 Backend
 **Phase:** Planning
 **MWU Tier:** LOW
 **Date:** 2026-05-20
-**Source stack:** PHP 5.6 + MySQL (utf8 3-byte) + procedural `mysql_*` query functions
-**Target stack:** FastAPI (Python 3.11+) + PostgreSQL 15+ (UTF-8) + SQLAlchemy 2.x async + Pydantic v2
-**Business Rules:** 9 rules (from comprehension BR catalog)
-**Dependencies:** none
+**Source stack:** PHP 5.6 + MySQL (mysql_* extension)
+**Target stack:** FastAPI 0.111+ + SQLAlchemy 2.x async + PostgreSQL 15+
+**Business Rules:** 10 rules (from comprehension BR catalog)
+**Dependencies:** none (MWU-NL2-002-FE is a downstream consumer, not a prerequisite)
 
 ---
 
 ## §1 — Target Data Model (DDL)
 
-This module owns one table: `notes`. The DDL below is valid PostgreSQL 15 syntax.
-No source-dialect types (MySQL `INT UNSIGNED`, `utf8mb4_unicode_ci`, etc.) appear here.
-
 ```sql
--- ============================================================
--- notes table
--- Owns: all note records for the application.
--- BR-009: created_at is DB-managed; the application never
---         supplies this value on INSERT.
--- BR-008: PostgreSQL's native UTF-8 is 4-byte; emoji and
---         supplementary Unicode are supported automatically.
--- BR-002: content is VARCHAR(500); DB enforces the cap as a
---         second layer after the app-layer Pydantic check.
--- ============================================================
+-- PostgreSQL 15+ DDL for notes table
+-- Owned by: MWU-NL2-001 Backend
 
 CREATE TABLE IF NOT EXISTS notes (
-    id          SERIAL          PRIMARY KEY,
-    content     VARCHAR(500)    NOT NULL,
-    created_at  TIMESTAMPTZ     NOT NULL DEFAULT CURRENT_TIMESTAMP
+    id          SERIAL                      PRIMARY KEY,
+    content     VARCHAR(500)                NOT NULL,
+    created_at  TIMESTAMP WITH TIME ZONE    NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- Index: supports BR-007 (always return notes newest-first).
--- Without this index every GET /api/notes performs a full sequential
--- scan + sort; the index makes ORDER BY created_at DESC a pure index
--- scan on any Postgres query planner version.
+-- BR-007: all list queries order by created_at DESC; index supports this hot path
 CREATE INDEX IF NOT EXISTS idx_notes_created_at_desc
     ON notes (created_at DESC);
 ```
 
-### Column specification
+**Design decisions:**
 
-| Column | Type | Nullable | Default | Notes |
-|--------|------|----------|---------|-------|
-| `id` | `SERIAL` (= `INTEGER` + sequence) | NOT NULL | auto-increment | PK; never supplied by app on INSERT |
-| `content` | `VARCHAR(500)` | NOT NULL | — | BR-002 DB-layer cap; BR-003 trimmed value stored |
-| `created_at` | `TIMESTAMPTZ` | NOT NULL | `CURRENT_TIMESTAMP` | BR-009: always DB-supplied; timezone-aware (RISK-006) |
-
-### Constraints summary
-
-| Constraint | Type | Columns | Expression |
-|------------|------|---------|------------|
-| `notes_pkey` | PRIMARY KEY | `id` | — |
-| `notes_content_not_empty` | CHECK | `content` | `LENGTH(TRIM(content)) > 0` |
-| `idx_notes_created_at_desc` | INDEX | `created_at DESC` | — |
-
-> **Note on the CHECK constraint:** The `LENGTH(TRIM(content)) > 0` constraint provides a database-level guarantee matching BR-001 + BR-003. The Pydantic validator is the primary enforcement layer; this constraint is a defensive backstop that prevents bypassing validation via direct DB writes.
+- `SERIAL` (auto-increment integer) maps cleanly from MySQL `AUTO_INCREMENT INT`. PostgreSQL 15 also supports `GENERATED ALWAYS AS IDENTITY` but `SERIAL` is simpler for SQLAlchemy 2.x compatibility.
+- `VARCHAR(500)` character-count limit enforces BR-002 at the DB layer as a defense-in-depth backstop. Pydantic performs the primary enforcement; the DB constraint catches any code path that bypasses validation.
+- `TIMESTAMP WITH TIME ZONE` (BR-008): MySQL `DATETIME` had no timezone; PostgreSQL `TIMESTAMPTZ` stores UTC internally and presents in the session timezone. Legacy timestamps are treated as UTC on migration.
+- `NOT NULL` on `created_at` with `DEFAULT CURRENT_TIMESTAMP` — value always server-generated, never supplied by the application layer (BR-009).
+- No soft-delete column — the legacy schema has none; adding one exceeds scope.
+- No user/session FK — system is fully public per BR-006.
 
 ---
 
 ## §2 — Target ORM / Data Access Models
 
-Uses SQLAlchemy 2.x declarative with `mapped_column` (typed mapping). All async.
-File target: `backend/models.py`
-
 ```python
-"""
-SQLAlchemy 2.x ORM model for the notes module.
-
-Maps exactly to the DDL in §1. Zero drift rule: any DDL change
-must be reflected here and vice versa.
-"""
-
+# app/models.py
 from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, Integer, String, func, text
+from sqlalchemy import DateTime, String, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 class Base(DeclarativeBase):
-    """Shared declarative base for all models in this service."""
     pass
 
 
 class Note(Base):
-    """
-    Persistent note record.
-
-    BR-002: content VARCHAR(500) — enforced at Pydantic layer first,
-            DB layer second.
-    BR-008: PostgreSQL UTF-8 is natively 4-byte; no charset declaration needed.
-    BR-009: created_at is server-default only; never set by application code.
-    RISK-006: DateTime(timezone=True) → TIMESTAMPTZ in PostgreSQL;
-              all timestamps are timezone-aware.
-    """
+    """ORM model for the notes table — owned by MWU-NL2-001."""
 
     __tablename__ = "notes"
 
-    # Primary key — auto-incremented by the DB sequence (SERIAL).
-    # The application never supplies `id` on INSERT.
-    id: Mapped[int] = mapped_column(
-        Integer,
-        primary_key=True,
-        autoincrement=True,
-        init=False,
-    )
-
-    # BR-002: max 500 chars enforced here (String(500)) and in Pydantic schema.
-    # BR-003: the trimmed value is what gets stored — trimming happens in the
-    #         Pydantic validator before this column ever receives the value.
-    content: Mapped[str] = mapped_column(
-        String(500),
-        nullable=False,
-    )
-
-    # BR-009: server_default means the DB sets this; app layer never touches it.
-    # RISK-006: timezone=True → TIMESTAMPTZ; stores and returns UTC-aware datetimes.
+    id: Mapped[int] = mapped_column(primary_key=True)
+    content: Mapped[str] = mapped_column(String(500), nullable=False)
+    # BR-009: DB sets this via server_default; omit init=False (BR-010 / pipeline lesson R-010)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
-        init=False,
     )
-
-    def __repr__(self) -> str:
-        return f"Note(id={self.id!r}, content={self.content[:30]!r}, created_at={self.created_at!r})"
 ```
 
-### Database session factory
-File target: `backend/database.py`
+**Design decisions:**
 
-```python
-"""
-Async database engine and session factory.
-
-RISK-008: DATABASE_URL is required. No hardcoded fallback credentials.
-          If the env var is absent the process raises KeyError at import
-          time — fail-fast, not silent misconfiguration.
-"""
-
-from __future__ import annotations
-
-import os
-from collections.abc import AsyncGenerator
-
-from sqlalchemy.ext.asyncio import (
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
-
-from backend.models import Base
-
-# RISK-008: KeyError if DATABASE_URL is missing — intentional fail-fast.
-# Acceptable values: postgresql+asyncpg://user:pass@host/db
-DATABASE_URL: str = os.environ["DATABASE_URL"]
-
-engine = create_async_engine(
-    DATABASE_URL,
-    echo=False,          # Set True only in local dev via env var if desired
-    pool_pre_ping=True,  # Recycles stale connections after DB restart
-)
-
-AsyncSessionLocal = async_sessionmaker(
-    engine,
-    class_=AsyncSession,
-    expire_on_commit=False,  # Allows reading attributes after commit without re-query
-)
-
-
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """
-    FastAPI dependency that yields an async SQLAlchemy session.
-    Session is committed/rolled-back by the caller (service layer).
-    Connection is always returned to the pool on exit.
-    """
-    async with AsyncSessionLocal() as session:
-        yield session
-
-
-async def create_tables() -> None:
-    """Create all tables defined in Base.metadata. Called during app lifespan startup."""
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-```
+- `DeclarativeBase` (SQLAlchemy 2.x) — NOT `MappedAsDataclass`. Therefore `init=False` **must not** appear anywhere in `mapped_column()`. This is a hard constraint from pipeline lesson R-010 / BR-BACKEND-010. `server_default=func.now()` is the correct way to express a DB-generated default without `init=False`.
+- `Mapped[datetime]` with `DateTime(timezone=True)` — matches `TIMESTAMP WITH TIME ZONE` in §1 exactly. Zero DDL/ORM drift.
+- `String(500)` length matches `VARCHAR(500)` in §1 — zero DDL/ORM drift.
+- No `__init__` override needed — SQLAlchemy 2.x `DeclarativeBase` generates a clean `__init__(id=..., content=..., created_at=...)`. Because `created_at` has `server_default`, it does not need to be supplied at object construction time; SQLAlchemy populates it after flush/refresh.
+- No `relationship()` declarations — no FK associations in this module.
 
 ---
 
 ## §3 — Validation Schemas / DTOs
 
-Uses Pydantic v2. All validators are `field_validator` with `mode="before"`.
-File target: `backend/schemas.py`
-
 ```python
-"""
-Pydantic v2 schemas for the notes API.
-
-Validation chain for note creation (BR-003 → BR-001 → BR-002):
-  1. BR-003: strip() whitespace
-  2. BR-001: reject empty string
-  3. BR-002: reject length > 500
-
-The chain order is enforced within a single validator so the sequence
-cannot be accidentally reordered by a future developer.
-"""
-
+# app/schemas.py
 from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-
-# ---------------------------------------------------------------------------
-# Input schemas (request bodies)
-# ---------------------------------------------------------------------------
 
 class NoteCreate(BaseModel):
-    """
-    Request body for POST /api/notes.
+    """Input schema for POST /api/notes.
 
-    Implements the BR-003 → BR-001 → BR-002 validation chain in strict order.
-    The trimmed value (BR-003) is what gets stored, not the raw input.
+    Enforces the BR-003 → BR-001 → BR-002 validation chain in strict order.
     """
 
-    content: str
+    content: str = Field(
+        ...,
+        description="Note text — trimmed before validation, max 500 characters",
+    )
 
     @field_validator("content", mode="before")
     @classmethod
     def validate_content(cls, v: object) -> str:
-        """
-        Enforces validation chain in mandatory order:
-          BR-003 — trim whitespace first
-          BR-001 — reject if empty after trim
-          BR-002 — reject if exceeds 500 chars after trim
-        """
         if not isinstance(v, str):
             raise ValueError("content must be a string")
 
-        # BR-003: trim whitespace; the trimmed result is stored, not the raw input
+        # BR-003: strip leading/trailing whitespace FIRST; stripped value is stored
         v = v.strip()
 
-        # BR-001: reject empty content (checked AFTER trim so "   " is correctly rejected)
+        # BR-001: after strip, value must not be empty
         if not v:
             raise ValueError("Note cannot be empty")
 
-        # BR-002: reject content exceeding 500 characters (checked on trimmed value)
+        # BR-002: character-count (not byte-count) must not exceed 500
         if len(v) > 500:
             raise ValueError("Note too long (max 500 chars)")
 
+        # Return trimmed value — this is what gets persisted (BR-003 confirmed)
         return v
 
 
-# ---------------------------------------------------------------------------
-# Response schemas (response bodies)
-# ---------------------------------------------------------------------------
-
 class NoteResponse(BaseModel):
-    """
-    Response schema for a single note.
+    """Output schema for all note endpoints."""
 
-    BR-009: created_at is always present (DB-supplied); never null.
-    from_attributes=True: required for SQLAlchemy ORM → Pydantic serialization.
-    """
+    model_config = ConfigDict(from_attributes=True)
 
     id: int
     content: str
     created_at: datetime
 
-    model_config = ConfigDict(from_attributes=True)
+
+class NoteListResponse(BaseModel):
+    """Envelope for GET /api/notes."""
+
+    notes: list[NoteResponse]
 
 
-class DeleteResponse(BaseModel):
-    """
-    Response body for a successful DELETE /api/notes/{note_id}.
+class ErrorResponse(BaseModel):
+    """Standard error payload for 4xx/5xx responses."""
 
-    Returns a minimal acknowledgement. Frontend checks ok=True to confirm deletion.
-    Chosen over 204 No Content to maintain parity with legacy ok:true JSON shape,
-    easing frontend migration (MWU-NL2-002-FE can detect success without
-    inspecting status codes alone).
-    """
-
-    ok: bool = True
+    detail: str
 ```
 
-### Schema → BR mapping summary
+**Validator chain rationale:**
 
-| Schema | Field | Validator | BR enforced |
-|--------|-------|-----------|-------------|
-| `NoteCreate` | `content` | `validate_content` step 1 | BR-003 (strip) |
-| `NoteCreate` | `content` | `validate_content` step 2 | BR-001 (not empty) |
-| `NoteCreate` | `content` | `validate_content` step 3 | BR-002 (≤ 500 chars) |
-| `NoteResponse` | `created_at` | — | BR-009 (always present) |
-| `NoteResponse` | — | `from_attributes=True` | — |
-| `DeleteResponse` | `ok` | — | BR-005 (only returned on success; 404 raised instead of returning ok=False) |
+- `mode="before"` ensures the validator runs before Pydantic's own type coercion, giving full control over the strip → empty-check → length-check sequence (BR-003 → BR-001 → BR-002).
+- The validator returns the trimmed value, not the original, matching confirmed legacy behaviour (Ambiguity #3 resolved: PHP stores the trimmed value).
+- `len(v) > 500` counts Unicode characters (code points), not bytes. This is the correct semantic per RISK-BACKEND-006 resolution — character-count is the intended semantic; byte-count was a PHP implementation incidental.
+- No auth fields anywhere — BR-006 mandates zero authentication across all schemas.
 
 ---
 
 ## §4 — API / Interface Design
 
-Three endpoints. No authentication anywhere (BR-006: CRITICAL hard constraint).
-File target: `backend/router.py`
+### Route Overview
 
-### Endpoint table
+| Method | Path | Input | Output | HTTP Status | BRs Enforced |
+|--------|------|-------|--------|-------------|--------------|
+| GET | /api/notes | none | NoteListResponse | 200 | BR-007 |
+| POST | /api/notes | NoteCreate (JSON body) | NoteResponse | 201 | BR-001, BR-002, BR-003 |
+| DELETE | /api/notes/{note_id} | note_id: int (path param) | empty body | 204 | BR-004, BR-005 |
 
-| Method | Path | Input | Output | Status codes | BRs enforced |
-|--------|------|-------|--------|--------------|--------------|
-| `GET` | `/api/notes` | — | `list[NoteResponse]` | 200 | BR-007 |
-| `POST` | `/api/notes` | `NoteCreate` (JSON body) | `NoteResponse` | 201, 422 | BR-001, BR-002, BR-003 |
-| `DELETE` | `/api/notes/{note_id}` | `note_id: int` (path) | `DeleteResponse` | 200, 404, 422 | BR-004, BR-005 |
+All endpoints: no authentication, no authorization headers (BR-006).
 
-### Status code specification
+---
 
-| Endpoint | Condition | Status | Response body |
-|----------|-----------|--------|---------------|
-| GET /api/notes | always succeeds | 200 | `[{id, content, created_at}, ...]` |
-| POST /api/notes | note created | 201 | `{id, content, created_at}` |
-| POST /api/notes | content empty after trim (BR-001) | 422 | `{"detail": [{"msg": "Note cannot be empty", ...}]}` |
-| POST /api/notes | content > 500 chars (BR-002) | 422 | `{"detail": [{"msg": "Note too long (max 500 chars)", ...}]}` |
-| DELETE /api/notes/{id} | note deleted | 200 | `{"ok": true}` |
-| DELETE /api/notes/{id} | id ≤ 0 (BR-004) | 422 | `{"detail": "Invalid note ID"}` |
-| DELETE /api/notes/{id} | id valid but note not found (BR-005) | 404 | `{"detail": "Note not found"}` |
-| DELETE /api/notes/{id} | id not an integer | 422 | FastAPI path validation error |
+### GET /api/notes
 
-### Auth requirement
-**None.** BR-006 is a CRITICAL hard constraint: the legacy source has no authentication,
-no sessions, no API keys, and no authorization anywhere. Adding any auth layer would
-violate source design and is explicitly forbidden.
+- **Purpose:** Retrieve all notes, newest first.
+- **Auth:** None (BR-006).
+- **Query params:** None — no pagination, no filtering, no sort parameter exposed.
+- **Response (200):**
+  ```json
+  {
+    "notes": [
+      {"id": 3, "content": "third note", "created_at": "2026-05-20T10:00:00+00:00"},
+      {"id": 2, "content": "second note", "created_at": "2026-05-19T09:00:00+00:00"}
+    ]
+  }
+  ```
+- **BR-007:** `ORDER BY created_at DESC` enforced in service layer — the API never exposes a sort parameter.
+- **Empty table:** returns `{"notes": []}` with status 200 — not a 404.
 
-### Router implementation
-File target: `backend/router.py`
+---
+
+### POST /api/notes
+
+- **Purpose:** Create a new note.
+- **Auth:** None (BR-006).
+- **Request body:**
+  ```json
+  {"content": "  my new note  "}
+  ```
+- **Validation chain:** Pydantic `NoteCreate.validate_content` runs BR-003 → BR-001 → BR-002 before the service layer is called.
+- **Response (201):**
+  ```json
+  {"id": 4, "content": "my new note", "created_at": "2026-05-20T10:01:00+00:00"}
+  ```
+  Note: `content` is the *trimmed* value (BR-003).
+- **Error responses:**
+  - `422 Unprocessable Entity` — `{"detail": [{"msg": "Note cannot be empty", ...}]}` (BR-001)
+  - `422 Unprocessable Entity` — `{"detail": [{"msg": "Note too long (max 500 chars)", ...}]}` (BR-002)
+  - FastAPI generates a structured 422 body from `ValidationError` automatically.
+
+---
+
+### DELETE /api/notes/{note_id}
+
+- **Purpose:** Delete a note by ID.
+- **Auth:** None (BR-006).
+- **Path param:** `note_id: int` — FastAPI coerces and type-validates automatically; non-integer path values return 422 before reaching the service layer.
+- **Response (204):** empty body on success.
+- **Error responses:**
+  - `422 Unprocessable Entity` — FastAPI rejects non-integer `note_id` at path-param coercion.
+  - `422 Unprocessable Entity` — Service raises `HTTPException(422)` when `note_id <= 0` (BR-004).
+  - `404 Not Found` — `{"detail": "Note not found"}` when delete affects zero rows (BR-005, GAP REMEDIATION).
+- **BR-004:** Application layer explicitly checks `note_id <= 0` and raises 422 before issuing SQL.
+- **BR-005:** `result.rowcount == 0` check post-DELETE raises 404. This is a confirmed behaviour change from legacy (approved GAP REMEDIATION per comprehension doc).
+
+---
+
+### Router Declaration
 
 ```python
-"""
-FastAPI router for the notes API.
+# app/router.py — top-level declaration
+from fastapi import APIRouter
 
-BR-006: No authentication, authorization, sessions, or API keys anywhere
-        in this module. This is a CRITICAL hard constraint from the source design.
-"""
-
-from __future__ import annotations
-
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from backend.database import get_db
-from backend.schemas import DeleteResponse, NoteCreate, NoteResponse
-from backend.service import NoteService
-
-router = APIRouter(prefix="/api", tags=["notes"])
-
-
-@router.get(
-    "/notes",
-    response_model=list[NoteResponse],
-    summary="List all notes",
-    description="Returns all notes ordered by creation date descending (newest first). BR-007.",
-)
-async def get_notes(
-    db: AsyncSession = Depends(get_db),
-) -> list[NoteResponse]:
-    """
-    BR-007: notes always returned newest-first; no client-configurable sort.
-    BR-006: no auth.
-    """
-    service = NoteService(db)
-    return await service.get_notes()
-
-
-@router.post(
-    "/notes",
-    response_model=NoteResponse,
-    status_code=201,
-    summary="Create a note",
-    description=(
-        "Creates a new note. "
-        "Content is whitespace-trimmed (BR-003), must not be empty (BR-001), "
-        "and must not exceed 500 characters (BR-002)."
-    ),
-)
-async def create_note(
-    payload: NoteCreate,
-    db: AsyncSession = Depends(get_db),
-) -> NoteResponse:
-    """
-    BR-001, BR-002, BR-003: enforced by NoteCreate Pydantic schema.
-    BR-009: created_at is set by DB server_default; app never supplies it.
-    BR-006: no auth.
-    RISK-005: REST + SPA eliminates PRG; POST returns 201 JSON, no redirect.
-    """
-    service = NoteService(db)
-    return await service.create_note(payload.content)
-
-
-@router.delete(
-    "/notes/{note_id}",
-    response_model=DeleteResponse,
-    status_code=200,
-    summary="Delete a note",
-    description=(
-        "Deletes a note by ID. "
-        "ID must be a positive integer (BR-004). "
-        "Returns 404 if the note does not exist (BR-005)."
-    ),
-)
-async def delete_note(
-    note_id: int,
-    db: AsyncSession = Depends(get_db),
-) -> DeleteResponse:
-    """
-    BR-004: reject note_id <= 0 with "Invalid note ID".
-    BR-005: 404 if note_id valid but note not found.
-    RISK-004: DELETE HTTP method; no GET-based deletion accepted.
-    BR-006: no auth.
-    """
-    # BR-004: cast to int happens via FastAPI path type annotation.
-    # Manual > 0 check produces the exact error message specified in BR-004.
-    if note_id <= 0:
-        raise HTTPException(status_code=422, detail="Invalid note ID")
-
-    service = NoteService(db)
-    await service.delete_note(note_id)
-    return DeleteResponse(ok=True)
+router = APIRouter(prefix="/api")
+# Mounted in main.py: app.include_router(router)
+# No dependencies=[Depends(some_auth)] — BR-006 mandates zero auth
 ```
 
 ---
 
 ## §5 — Service Layer Design
 
-Single service class `NoteService`. All database access is async.
-File target: `backend/service.py`
+### NoteService
 
 ```python
-"""
-Business logic layer for notes.
-
-Each method is annotated with the BRs it implements.
-Database access uses SQLAlchemy 2.x core-style expressions (parameterized —
-RISK-002: no string interpolation or f-string SQL anywhere).
-"""
-
+# app/service.py
 from __future__ import annotations
 
-from fastapi import HTTPException
-from sqlalchemy import delete, insert, select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import HTTPException
 
-from backend.models import Note
+from app.models import Note
+from app.schemas import NoteCreate
 
 
 class NoteService:
-    """
-    Handles all business logic for note CRUD operations.
+    """All business logic for the notes module — stateless, async."""
 
-    Constructed per-request with the FastAPI-injected AsyncSession.
-    No shared state between requests.
-    """
+    @staticmethod
+    async def list_notes(db: AsyncSession) -> list[Note]:
+        """Return all notes ordered newest-first.
 
-    def __init__(self, db: AsyncSession) -> None:
-        self._db = db
-
-    # ------------------------------------------------------------------
-    # get_notes
-    # ------------------------------------------------------------------
-
-    async def get_notes(self) -> list[Note]:
+        BR-007: ORDER BY created_at DESC, no user-configurable sort.
         """
-        Return all notes ordered by created_at DESC.
-
-        BR-007: sort order is newest-first and is NOT configurable by
-                the caller. The ORDER BY is hardcoded here — no sort
-                parameter is accepted.
-
-        RISK-002: uses parameterized SQLAlchemy select(), not raw SQL.
-        """
-        result = await self._db.execute(
+        result = await db.execute(
             select(Note).order_by(Note.created_at.desc())
         )
         return list(result.scalars().all())
 
-    # ------------------------------------------------------------------
-    # create_note
-    # ------------------------------------------------------------------
+    @staticmethod
+    async def create_note(db: AsyncSession, data: NoteCreate) -> Note:
+        """Persist a new note.
 
-    async def create_note(self, content: str) -> Note:
+        BR-003/001/002: already enforced by Pydantic before this method is called.
+        BR-009: created_at not passed — DB server_default applies.
+        RISK-005: flush + refresh to populate auto-generated id and created_at.
         """
-        Persist a new note and return the full record.
-
-        BR-003: content has already been stripped by the Pydantic schema;
-                this method receives only the trimmed value.
-        BR-001, BR-002: enforced upstream by NoteCreate schema;
-                not re-validated here (single source of truth).
-        BR-009: created_at is set by DB server_default; the INSERT
-                statement never includes a value for that column.
-        RISK-002: uses parameterized ORM add() — no f-string SQL.
-        RISK-005: returns the ORM Note object; no server-side redirect.
-        """
-        note = Note(content=content)
-        self._db.add(note)
-        await self._db.commit()
-        await self._db.refresh(note)  # Populates id and created_at from DB
+        note = Note(content=data.content)
+        db.add(note)
+        await db.flush()
+        await db.refresh(note)  # populates id and server-generated created_at
         return note
 
-    # ------------------------------------------------------------------
-    # delete_note
-    # ------------------------------------------------------------------
+    @staticmethod
+    async def delete_note(db: AsyncSession, note_id: int) -> None:
+        """Delete a note by ID.
 
-    async def delete_note(self, note_id: int) -> None:
+        BR-004: note_id must be a positive integer (> 0).
+        BR-005: raise 404 when note does not exist (GAP REMEDIATION).
         """
-        Delete a note by primary key. Raises 404 if no row was deleted.
+        # BR-004: guard against zero or negative ID before issuing SQL
+        if note_id <= 0:
+            raise HTTPException(status_code=422, detail="Invalid note ID")
 
-        BR-004: note_id > 0 is enforced at the router layer before this
-                method is called; this method trusts a positive integer.
-        BR-005: checks result.rowcount after DELETE. If 0 rows were
-                affected the note did not exist → raise 404. This is a
-                GAP REMEDIATION — legacy PHP silently returned ok:true
-                even when no row was deleted. The target behaviour is
-                explicit 404 as specified in the comprehension doc.
-        RISK-002: uses parameterized delete() expression — no f-string SQL.
-        """
-        result = await self._db.execute(
+        result = await db.execute(
             delete(Note).where(Note.id == note_id)
         )
-        await self._db.commit()
-
-        # BR-005 gap remediation: rowcount == 0 means note did not exist
+        # BR-005: legacy silently returned ok:true — target returns 404
         if result.rowcount == 0:
             raise HTTPException(status_code=404, detail="Note not found")
 ```
 
-### Method signature summary
+---
 
-| Method | Signature | BRs | Transaction |
-|--------|-----------|-----|-------------|
-| `get_notes` | `async def get_notes(self) -> list[Note]` | BR-007 | Read-only; no commit |
-| `create_note` | `async def create_note(self, content: str) -> Note` | BR-003 (upstream), BR-001 (upstream), BR-002 (upstream), BR-009 | Commit after add |
-| `delete_note` | `async def delete_note(self, note_id: int) -> None` | BR-004 (upstream), BR-005 | Commit after delete; 404 if rowcount==0 |
-
-### Application entrypoint
-File target: `backend/main.py`
+### Database Session Dependency
 
 ```python
-"""
-FastAPI application entrypoint.
-
-Registers the notes router and manages DB table creation during lifespan.
-BR-006: no auth middleware, no session middleware, no API key middleware.
-"""
-
+# app/database.py
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 from collections.abc import AsyncGenerator
 
-from fastapi import FastAPI
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from backend.database import create_tables
-from backend.router import router
+from app.config import settings
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Create tables on startup (idempotent — uses CREATE TABLE IF NOT EXISTS)."""
-    await create_tables()
-    yield
-
-
-app = FastAPI(
-    title="Note List API",
-    version="2.0.0",
-    description="Note List migration — MWU-NL2-001 backend.",
-    lifespan=lifespan,
+engine = create_async_engine(
+    settings.database_url,
+    echo=settings.db_echo,
+    pool_pre_ping=True,
 )
 
-# BR-006: no auth router, no middleware for auth/sessions/API keys
+async_session: async_sessionmaker[AsyncSession] = async_sessionmaker(
+    engine, expire_on_commit=False
+)
+
+
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """FastAPI dependency — yields one AsyncSession per request.
+
+    RISK-002: replaces the global $conn anti-pattern.
+    Transaction committed on clean exit; rolled back on exception.
+    """
+    async with async_session() as session:
+        async with session.begin():
+            yield session
+```
+
+---
+
+### Application Settings
+
+```python
+# app/config.py
+from __future__ import annotations
+
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    """BR-010: DB credentials read from environment variables with fallbacks."""
+
+    db_host: str = "localhost"
+    db_user: str = "postgres"
+    db_pass: str = ""
+    db_name: str = "notelist"
+    db_port: int = 5432
+    db_echo: bool = False
+
+    @property
+    def database_url(self) -> str:
+        return (
+            f"postgresql+asyncpg://{self.db_user}:{self.db_pass}"
+            f"@{self.db_host}:{self.db_port}/{self.db_name}"
+        )
+
+    model_config = {"env_prefix": "DB_", "env_file": ".env"}
+
+
+settings = Settings()
+```
+
+---
+
+### Router Implementation
+
+```python
+# app/router.py
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends, Response
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database import get_db
+from app.schemas import NoteCreate, NoteListResponse, NoteResponse
+from app.service import NoteService
+
+router = APIRouter(prefix="/api")
+
+
+@router.get("/notes", response_model=NoteListResponse)
+async def list_notes(db: AsyncSession = Depends(get_db)) -> NoteListResponse:
+    """BR-007: newest-first; BR-006: no auth."""
+    notes = await NoteService.list_notes(db)
+    return NoteListResponse(notes=notes)
+
+
+@router.post("/notes", response_model=NoteResponse, status_code=201)
+async def create_note(
+    data: NoteCreate,
+    db: AsyncSession = Depends(get_db),
+) -> NoteResponse:
+    """BR-001/002/003 enforced by Pydantic; BR-006: no auth."""
+    note = await NoteService.create_note(db, data)
+    return NoteResponse.model_validate(note)
+
+
+@router.delete("/notes/{note_id}", status_code=204)
+async def delete_note(
+    note_id: int,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """BR-004/005 enforced in service layer; BR-006: no auth."""
+    await NoteService.delete_note(db, note_id)
+    return Response(status_code=204)
+```
+
+---
+
+### Main Application
+
+```python
+# app/main.py
+from __future__ import annotations
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.router import router
+
+app = FastAPI(title="Note List API", version="2.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Content-Type"],
+)
+
 app.include_router(router)
 ```
 
 ---
 
+### Service Layer Method Summary
+
+| Method | BR(s) | Transaction scope | Raises |
+|--------|-------|-------------------|--------|
+| `list_notes(db)` | BR-007 | read-only SELECT | SQLAlchemyError → 500 (unhandled, FastAPI default) |
+| `create_note(db, data)` | BR-003/001/002 (Pydantic), BR-009 (server default) | write + flush + refresh | SQLAlchemyError → 500 |
+| `delete_note(db, note_id)` | BR-004, BR-005 | write | HTTPException 422 (bad ID), HTTPException 404 (not found), SQLAlchemyError → 500 |
+
+---
+
 ## §6 — Risk Register and Mitigations
 
-### RISK-001: HIGH — Delete Silent No-Op on Missing Note
+### RISK-BACKEND-001: HIGH — mysql_* Extension Removal
 
-**Source behaviour:**
-Legacy PHP (`index.php:35-43`) executes `DELETE FROM notes WHERE id = ?` and
-immediately returns `{"ok": true}` regardless of whether any row was actually
-deleted. If the note did not exist, the caller receives a success response with
-no indication of the failure. The frontend cannot distinguish "deleted" from
-"was never there."
+**Source behaviour:** All data access used `mysql_connect`, `mysql_query`, `mysql_fetch_assoc`, `mysql_real_escape_string`. These functions do not exist in Python. String concatenation was the parameterisation mechanism.
+
+```php
+// Legacy pattern
+$content = mysql_real_escape_string($content);
+$query = "INSERT INTO notes (content) VALUES ('$content')";
+mysql_query($query, $conn);
+```
 
 **Target implementation:**
-After executing the `DELETE` statement, check `result.rowcount`. If zero rows
-were affected, the note does not exist — raise 404.
-
 ```python
-result = await self._db.execute(
-    delete(Note).where(Note.id == note_id)
-)
-await self._db.commit()
+# CORRECT — ORM insert, no string concatenation, no injection surface
+note = Note(content=data.content)
+db.add(note)
+await db.flush()
+await db.refresh(note)
 
+# CORRECT — parameterized SELECT
+result = await db.execute(select(Note).order_by(Note.created_at.desc()))
+
+# CORRECT — parameterized DELETE
+result = await db.execute(delete(Note).where(Note.id == note_id))
+```
+
+**Do NOT use:** `text()` with f-string interpolation, any `mysql_real_escape_string` equivalent, or manual SQL string construction.
+
+**Validation approach:** SQL injection test vectors (e.g., `content = "'; DROP TABLE notes; --"`) must be stored as literal text, never executed as SQL. Verified in §9 injection test cases.
+
+---
+
+### RISK-BACKEND-002: MEDIUM — Global Connection State
+
+**Source behaviour:**
+```php
+// db.php
+global $conn;
+$conn = new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME);
+```
+Module-level connection shared across all function calls within a PHP request.
+
+**Target implementation:**
+```python
+# CORRECT — per-request session via FastAPI dependency injection
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    async with async_session() as session:
+        async with session.begin():
+            yield session
+
+# In router — session scoped to the HTTP request lifetime
+@router.get("/notes")
+async def list_notes(db: AsyncSession = Depends(get_db)):
+    ...
+```
+
+**Do NOT use:** Module-level `AsyncSession` instance, `app.state.db`, or any pattern that shares a session across concurrent requests.
+
+**Validation approach:** Concurrent request integration tests must show independent transactions with no cross-request state contamination.
+
+---
+
+### RISK-BACKEND-003: HIGH — Raw SQL Concatenation (SQL Injection)
+
+**Source behaviour:** Even with `mysql_real_escape_string`, the pattern is architecturally unsafe — any missed escape call creates an injection vector. Legacy code had this gap.
+
+**Target implementation:**
+```python
+# All three data operations use ORM — zero manual SQL construction
+# list: select(Note).order_by(Note.created_at.desc())
+# insert: Note(content=data.content) + db.add(note)
+# delete: delete(Note).where(Note.id == note_id)
+```
+
+**Do NOT use:** `text(f"INSERT INTO notes (content) VALUES ('{data.content}')")` or any f-string in a SQL expression.
+
+**Validation approach:** Injection payloads in §9 must return 201 with the payload stored as literal text, verifiable by fetching the created note and asserting `content == payload_string`.
+
+---
+
+### RISK-BACKEND-004: MEDIUM — DELETE via HTTP GET
+
+**Source behaviour:** `GET /?delete=3` triggered a deletion — violates HTTP idempotency/safety semantics.
+
+**Target implementation:**
+```python
+@router.delete("/notes/{note_id}", status_code=204)
+async def delete_note(note_id: int, db: AsyncSession = Depends(get_db)) -> Response:
+    await NoteService.delete_note(db, note_id)
+    return Response(status_code=204)
+```
+
+**Coordination point:** MWU-NL2-002-FE must send `DELETE /api/notes/{id}`. Comprehension doc records this as FULLY_VALIDATED.
+
+**Validation approach:** `GET /api/notes/3` must return 405 Method Not Allowed, not perform a deletion.
+
+---
+
+### RISK-BACKEND-005: LOW — mysql_insert_id Replacement
+
+**Source behaviour:** PHP used `mysql_insert_id()` to retrieve the auto-generated PK after insert.
+
+**Target implementation:**
+```python
+note = Note(content=data.content)
+db.add(note)
+await db.flush()    # issues INSERT; SQLAlchemy reads back RETURNING id
+await db.refresh(note)  # re-reads all server-generated columns
+return note  # note.id and note.created_at are now populated
+```
+
+**Do NOT use:** `text("SELECT lastval()")`, raw `RETURNING` clause in a `text()` call.
+
+**Validation approach:** POST /api/notes must return a response with a valid positive integer `id` and a non-null `created_at`.
+
+---
+
+### RISK-BACKEND-006: LOW — strlen Byte vs Character Count
+
+**Source behaviour:** PHP `strlen("café")` returns 5 (counts bytes, not characters — "é" is 2 bytes in UTF-8). A 500-byte string may be fewer than 500 characters.
+
+**Target implementation:**
+```python
+# CORRECT — character count (Unicode code points)
+if len(v) > 500:
+    raise ValueError("Note too long (max 500 chars)")
+```
+`VARCHAR(500)` in PostgreSQL also counts characters. For ASCII-only content (dominant use case), behaviour is identical. For multi-byte Unicode, Python/PG behaviour is more permissive than legacy PHP.
+
+**Resolution:** Character-count is the correct semantic per RISK-BACKEND-006. Do NOT implement byte-length checking to match PHP behaviour.
+
+**Validation approach:** Test with a 500-character string containing multi-byte Unicode (e.g., 250 two-byte characters) — must be accepted. Test with 501 characters — must be rejected.
+
+---
+
+### RISK-BACKEND-007: MEDIUM — No Row-Not-Found Check on Delete
+
+**Source behaviour:** Legacy `delete_note()` executed a DELETE query and returned `{"ok": true}` regardless of whether any row was affected.
+
+**Target implementation:**
+```python
+result = await db.execute(delete(Note).where(Note.id == note_id))
 if result.rowcount == 0:
     raise HTTPException(status_code=404, detail="Note not found")
 ```
 
-**Validation approach:**
-Test `DELETE /api/notes/9999` against an empty database. Assert HTTP 404 and
-`{"detail": "Note not found"}`. Test `DELETE /api/notes/{valid_id}` after
-creating a note. Assert HTTP 200 and `{"ok": true}`. Test double-delete: create,
-delete (200), delete again (404).
+This is a deliberate behaviour change (GAP REMEDIATION, Ambiguity #2 approved per comprehension doc).
+
+**Validation approach:** `DELETE /api/notes/99999` against an empty or non-matching table must return 404.
 
 ---
 
-### RISK-002: HIGH — SQL Injection via String Interpolation
+### RISK-BACKEND-008: LOW — DATETIME to TIMESTAMPTZ
 
-**Source behaviour:**
-Legacy PHP used `mysql_*` functions (deprecated since PHP 5.5, removed in PHP 7).
-Pattern: `mysql_query("DELETE FROM notes WHERE id = " . $id)` — direct string
-concatenation of user input into SQL. Completely vulnerable to SQL injection.
+**Source behaviour:** MySQL `DATETIME` stores local time with no timezone metadata. Legacy deployment treated all times as UTC implicitly.
 
 **Target implementation:**
-All SQLAlchemy expressions use parameterized bindings. No `text()` with f-strings.
-No string concatenation with user data. All three operations use typed ORM expressions:
-
 ```python
-# GET — parameterized ORDER BY (no user input in this query)
-select(Note).order_by(Note.created_at.desc())
-
-# POST — ORM add(); SQLAlchemy generates parameterized INSERT
-note = Note(content=content)
-self._db.add(note)
-
-# DELETE — parameterized WHERE clause via ORM expression
-delete(Note).where(Note.id == note_id)
+created_at: Mapped[datetime] = mapped_column(
+    DateTime(timezone=True),  # maps to TIMESTAMP WITH TIME ZONE
+    server_default=func.now(),
+    nullable=False,
+)
 ```
+All legacy seed data timestamps treated as UTC on migration (see §8).
 
-**What NOT to write:**
-```python
-# FORBIDDEN — f-string SQL injection vector
-await db.execute(text(f"DELETE FROM notes WHERE id = {note_id}"))
-
-# FORBIDDEN — string formatting
-await db.execute(text("DELETE FROM notes WHERE id = %s" % note_id))
-```
-
-**Validation approach:**
-Test `DELETE /api/notes/1%3BDROP%20TABLE%20notes` (URL-encoded `;DROP TABLE notes`).
-FastAPI path type annotation `note_id: int` rejects this at routing time with 422.
-Test `POST /api/notes` with `{"content": "'; DROP TABLE notes; --"}`.
-Assert the string is stored literally and `SELECT * FROM notes` still returns rows.
+**Validation approach:** `created_at` in API responses must include timezone offset (e.g., `"2026-05-20T10:00:00+00:00"`, not `"2026-05-20T10:00:00"`).
 
 ---
 
-### RISK-003: MEDIUM — Deprecated `mysql_*` API
+### RISK-BACKEND-009: MEDIUM — No Error Handling on mysql_query Failures
 
-**Source behaviour:**
-Legacy PHP used `mysql_connect()`, `mysql_query()`, `mysql_fetch_assoc()` —
-the `ext/mysql` extension removed in PHP 7. These are synchronous, unbuffered,
-and provide no prepared statement support.
+**Source behaviour:** `mysql_query()` returned `false` on failure; legacy code did not check this return value, silently ignoring DB errors.
 
-**Target implementation:**
-Fully resolved by migration to SQLAlchemy 2.x async with `asyncpg` driver.
-No action required beyond using the standard async session pattern as specified
-in §2 and §5. The entire query execution path is parameterized and async.
+**Target implementation:** SQLAlchemy raises `SQLAlchemyError` on failure. FastAPI's default exception handler converts unhandled exceptions to 500. No explicit try/except needed for general DB failures — FastAPI handles them correctly.
 
-**Validation approach:** N/A — resolved by architecture choice.
+For constraint violations (e.g., content exceeding `VARCHAR(500)` at DB level), Pydantic prevents the condition from reaching the DB. No specific handler is needed.
+
+**Validation approach:** Integration test with DB unavailable must return 500, not hang or return 200 with partial data.
 
 ---
 
-### RISK-004: MEDIUM — DELETE via HTTP GET
+### RISK-BACKEND-010: HIGH — init=False in mapped_column() (PIPELINE LESSON R-010)
 
-**Source behaviour:**
-Legacy PHP (`index.php`) handles deletion via `$_GET['delete']` — the delete
-operation is triggered by a GET request with a query parameter. This violates
-HTTP semantics (GET must be idempotent and side-effect-free) and is vulnerable
-to CSRF via `<img src="...?delete=1">` tags.
+**Source behaviour:** N/A — this is a target-stack trap, not a legacy pattern.
 
 **Target implementation:**
-`DELETE /api/notes/{note_id}` uses the HTTP DELETE method exclusively.
-The router registration `@router.delete(...)` means FastAPI only routes HTTP
-DELETE requests to this handler. A GET request to the same path returns 405
-Method Not Allowed automatically.
-
 ```python
-@router.delete("/notes/{note_id}", ...)
-async def delete_note(note_id: int, ...):
-    ...
-```
-
-**What NOT to write:**
-```python
-# FORBIDDEN — GET-based delete
-@router.get("/notes")
-async def get_notes(delete: int = None, ...):
-    if delete:
-        await service.delete_note(delete)
-```
-
-**Validation approach:**
-`GET /api/notes/1` must return 405 Method Not Allowed (FastAPI default behaviour
-for unregistered methods on a path). Only `DELETE /api/notes/1` returns 200/404.
-
----
-
-### RISK-005: MEDIUM — No PRG Pattern (Duplicate on Refresh)
-
-**Source behaviour:**
-Legacy PHP returns an HTML page after a form POST. If the user presses browser
-Refresh, the browser re-submits the POST form, potentially creating a duplicate
-note. The PRG (Post-Redirect-Get) pattern was a workaround for this.
-
-**Target implementation:**
-Fully resolved by the REST API + SPA architecture. `POST /api/notes` returns
-JSON (HTTP 201); the React SPA (MWU-NL2-002-FE) handles state updates and
-navigation. There is no page reload, no browser form submission, and no refresh
-risk. Server-side redirects must NOT be implemented.
-
-**Validation approach:** N/A — resolved by architecture.
-
----
-
-### RISK-006: MEDIUM — `DATETIME` to `TIMESTAMP WITH TIME ZONE`
-
-**Source behaviour:**
-MySQL `DATETIME` stores no timezone information. The legacy schema uses
-`created_at DATETIME DEFAULT CURRENT_TIMESTAMP`. Timestamps are stored as
-bare local time with no timezone record. Two notes created in different
-timezones can have ambiguous ordering if the server's timezone changes.
-
-**Target implementation:**
-PostgreSQL `TIMESTAMPTZ` stores UTC internally and converts on read.
-`DateTime(timezone=True)` in SQLAlchemy generates `TIMESTAMPTZ`. All timestamps
-are unambiguous UTC regardless of server timezone setting.
-
-```python
-# In Note model (§2):
+# CORRECT — server_default only, init=False omitted entirely
 created_at: Mapped[datetime] = mapped_column(
     DateTime(timezone=True),
     server_default=func.now(),
     nullable=False,
-    init=False,
 )
+
+# WRONG — raises InvalidRequestError at mapper configuration time on DeclarativeBase
+# created_at: Mapped[datetime] = mapped_column(..., init=False)
 ```
 
-**Assumption documented:** Legacy data without timezone info is treated as UTC
-during any future data migration. No historical data migration is in scope for
-this MWU (schema is created fresh — see §8).
+`init=False` is only valid on `MappedAsDataclass`. On `DeclarativeBase` it raises `sqlalchemy.orm.exc.InvalidRequestError` at application startup before any request is served.
 
-**Validation approach:**
-Assert `NoteResponse.created_at` includes timezone info (`tzinfo` is not None).
-Assert stored value round-trips correctly: create note, retrieve, confirm
-`created_at.tzinfo` is UTC-aware.
-
----
-
-### RISK-007: LOW — MySQL `utf8` 3-Byte Limitation
-
-**Source behaviour:**
-MySQL's `utf8` charset stores only 3-byte Unicode (BMP only). Emoji and
-supplementary Unicode (U+10000 and above) are silently truncated or cause errors.
-The legacy schema uses `DEFAULT CHARSET=utf8`.
-
-**Target implementation:**
-No action required. PostgreSQL's native `UTF8` encoding is always 4-byte.
-Emoji, supplementary Unicode, and all characters in the Unicode standard are
-stored correctly without any configuration change. The `VARCHAR(500)` length
-limit is measured in characters (code points), not bytes.
-
-**Validation approach:**
-`POST /api/notes` with `content="Hello 🎉"`. Retrieve and assert content matches
-exactly including the emoji. Assert length is 8 (7 chars + 1 emoji code point),
-well under 500.
-
----
-
-### RISK-008: LOW — Hardcoded DB Credential Fallbacks
-
-**Source behaviour:**
-Legacy `db.php` contains hardcoded fallback credentials:
-`$host = "localhost"; $user = "noteuser"; $pass = "notepass"; $db = "notes_db";`
-These credentials appear in source control and provide a default that works in
-dev but is silently used in prod if env vars are not set.
-
-**Target implementation:**
-`DATABASE_URL` is required. If absent the process raises `KeyError` at import time —
-fail-fast, not silent misconfiguration. No default value, no fallback credentials.
-
-```python
-# RISK-008: KeyError if missing — intentional fail-fast
-DATABASE_URL: str = os.environ["DATABASE_URL"]
-```
-
-**What NOT to write:**
-```python
-# FORBIDDEN — hardcoded fallback
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://noteuser:notepass@localhost/notes_db")
-```
-
-**Validation approach:**
-Unset `DATABASE_URL` and attempt to import `backend.database`. Assert `KeyError`
-is raised immediately. Confirm no default connection string exists anywhere in
-the codebase (`grep -r "noteuser\|notepass" backend/`).
+**Validation approach:** `python -c "from app.models import Note"` must exit 0 without any SQLAlchemy mapper errors.
 
 ---
 
 ## §7 — Cross-Module Stubs
 
-**N/A — no cross-module dependencies.**
+N/A — no cross-module dependencies require Python stub classes.
 
-The backend module (MWU-NL2-001) has no upstream dependencies. It is entirely
-self-contained. The downstream consumer MWU-NL2-002-FE (React frontend) depends
-on this module's three REST endpoints, but the dependency flows one-way: frontend
-calls backend. The backend does not call the frontend, and does not call any other
-module.
+The three cross-module touchpoints with MWU-NL2-002-FE (BR-004, BR-005, BR-007) are REST API contracts. The backend publishes HTTP endpoints; the frontend consumes them over HTTP. The backend does not import or call any frontend Python module. No stub classes are needed.
 
-No stub classes are required.
+MWU-NL2-002-FE is already FULLY_VALIDATED and will integrate via the REST API contract defined in §4.
 
 ---
 
 ## §8 — Data Migration
 
-**N/A — schema created fresh.**
+### Column Type Conversion Map
 
-The target PostgreSQL database is provisioned fresh for this migration.
-No existing MySQL data is being migrated in this MWU. The `CREATE TABLE IF NOT EXISTS`
-in §1 initialises the schema on first startup via the `lifespan` handler in `main.py`.
+| Column | MySQL Source Type | PostgreSQL Target Type | Conversion Notes |
+|--------|-------------------|----------------------|------------------|
+| `id` | `INT AUTO_INCREMENT` | `SERIAL` (INTEGER) | Auto-increment semantics identical; sequence reset required post-import |
+| `content` | `VARCHAR(500) CHARACTER SET utf8` | `VARCHAR(500)` | MySQL 3-byte utf8 → PostgreSQL 4-byte UTF-8; all existing content is valid |
+| `created_at` | `DATETIME` (no TZ) | `TIMESTAMP WITH TIME ZONE` | Legacy values treated as UTC; stored as UTC in TIMESTAMPTZ |
 
-**Future data migration note (out of scope for MWU-NL2-001):**
-If historical notes data is later migrated from MySQL to PostgreSQL:
-- `id INT AUTO_INCREMENT` → `SERIAL` (values preserved; reset sequence with `SELECT setval('notes_id_seq', MAX(id)) FROM notes`)
-- `content VARCHAR(500)` → `VARCHAR(500)` (direct copy; re-validate length in migration script)
-- `created_at DATETIME` → `TIMESTAMPTZ` (treat as UTC per RISK-006 assumption: `AT TIME ZONE 'UTC'`)
-- Emoji in content stored with MySQL `utf8` charset: re-validate all rows > 3 bytes; any 4-byte sequences were silently truncated in MySQL and must be handled as data loss
+### Sentinel / Magic Value Conversions
+
+None. The notes table has no sentinel values, no soft-delete flags, no boolean integers, no NULL-as-sentinel patterns.
+
+### Encoding and Collation
+
+MySQL `CHARACTER SET utf8` is MySQL's 3-byte UTF-8 variant — it cannot store 4-byte characters (emoji, supplementary CJK). PostgreSQL uses true 4-byte UTF-8 by default. The migration is safe: all content valid in MySQL `utf8` is valid in PostgreSQL `utf8`. After migration, new content can include 4-byte characters.
+
+```sql
+-- Database creation with explicit UTF-8 collation
+CREATE DATABASE notelist
+    ENCODING = 'UTF8'
+    LC_COLLATE = 'en_US.UTF-8'
+    LC_CTYPE = 'en_US.UTF-8'
+    TEMPLATE = template0;
+```
+
+### Migration Script (MySQL → PostgreSQL)
+
+```sql
+-- Step 1: Create schema (run §1 DDL)
+-- (CREATE TABLE notes ...; CREATE INDEX ...)
+
+-- Step 2: Bulk-import from MySQL
+-- Recommended tool: pgloader
+--
+--   pgloader mysql://legacy_user:pass@legacy_host/notelist_mysql \
+--             postgresql://pg_user:pass@pg_host/notelist
+--
+-- pgloader handles automatically:
+--   - DATETIME → TIMESTAMPTZ (treats source as UTC)
+--   - 3-byte utf8 charset upgrade to PostgreSQL UTF-8
+--   - AUTO_INCREMENT → SERIAL sequence value carry-over
+
+-- Step 3: After bulk import, reset the SERIAL sequence to prevent PK collisions
+SELECT setval('notes_id_seq', COALESCE((SELECT MAX(id) FROM notes), 0));
+
+-- Step 4: Verify row counts match
+-- Run on PostgreSQL:  SELECT COUNT(*) FROM notes;
+-- Run on MySQL:       SELECT COUNT(*) FROM notes;
+-- Counts must be equal before cutting over.
+
+-- Step 5: Verify sample content round-trip
+-- SELECT id, content, created_at FROM notes ORDER BY id LIMIT 10;
+-- Compare against MySQL source.
+```
+
+If deploying fresh with no legacy data migration, only the §1 DDL is required.
 
 ---
 
 ## §9 — Test Strategy
 
-File targets: `backend/tests/conftest.py`, `backend/tests/test_notes.py`
-
-### Fixtures
+### Test Infrastructure
 
 ```python
-# backend/tests/conftest.py
+# tests/conftest.py
+from __future__ import annotations
 
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
-from backend.main import app
-from backend.database import get_db
-from backend.models import Base
+from app.database import get_db
+from app.main import app
+from app.models import Base
 
-TEST_DATABASE_URL = "postgresql+asyncpg://test:test@localhost/test_notes"
+TEST_DATABASE_URL = "postgresql+asyncpg://test:test@localhost:5432/notelist_test"
 
-@pytest_asyncio.fixture(scope="function")
+
+@pytest_asyncio.fixture(scope="session")
 async def db_engine():
     engine = create_async_engine(TEST_DATABASE_URL)
     async with engine.begin() as conn:
@@ -868,243 +761,226 @@ async def db_engine():
         await conn.run_sync(Base.metadata.drop_all)
     await engine.dispose()
 
-@pytest_asyncio.fixture(scope="function")
-async def db_session(db_engine):
-    AsyncTestSession = async_sessionmaker(db_engine, expire_on_commit=False)
-    async with AsyncTestSession() as session:
-        yield session
 
-@pytest_asyncio.fixture(scope="function")
-async def client(db_session):
+@pytest_asyncio.fixture
+async def db_session(db_engine):
+    async_sess = async_sessionmaker(db_engine, expire_on_commit=False)
+    async with async_sess() as session:
+        async with session.begin():
+            yield session
+            await session.rollback()  # isolate each test — no state leaks
+
+
+@pytest_asyncio.fixture
+async def client(db_session: AsyncSession):
     async def override_get_db():
         yield db_session
+
     app.dependency_overrides[get_db] = override_get_db
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-        yield c
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as ac:
+        yield ac
     app.dependency_overrides.clear()
+
+
+@pytest_asyncio.fixture
+async def seed_notes(db_session: AsyncSession):
+    from app.models import Note
+
+    notes = [Note(content=f"seed note {i}") for i in range(3)]
+    db_session.add_all(notes)
+    await db_session.flush()
+    for n in notes:
+        await db_session.refresh(n)
+    return notes
 ```
 
-### Test matrix
+---
 
-| BR ID | Test type | Scenario | Expected result |
+### Test Case Table
+
+| BR ID | Test Type | Scenario | Expected Result |
 |-------|-----------|----------|-----------------|
-| BR-001 | Unit | POST with `content: ""` | 422, `"Note cannot be empty"` |
-| BR-001 | Unit | POST with `content: "   "` (spaces only) | 422, `"Note cannot be empty"` |
-| BR-001 | Unit | POST with `content: "\t\n"` (whitespace only) | 422, `"Note cannot be empty"` |
-| BR-002 | Unit | POST with content of exactly 500 chars | 201, note created |
-| BR-002 | Unit | POST with content of 501 chars | 422, `"Note too long (max 500 chars)"` |
-| BR-002 | Unit | POST with content of 1000 chars | 422, `"Note too long (max 500 chars)"` |
-| BR-003 | Unit | POST with `content: "  hello  "` | 201, stored content is `"hello"` (trimmed) |
-| BR-003 | Unit | POST with `content: "\nhello\n"` | 201, stored content is `"hello"` |
-| BR-003+001 | Unit | POST `"   "` — trim then empty check | 422 (not 201); order matters |
-| BR-003+002 | Unit | POST 498 spaces + `"ab"` → trimmed = `"ab"` (2 chars) | 201; trim reduces to 2 chars |
-| BR-004 | Unit | DELETE `/api/notes/0` | 422, `"Invalid note ID"` |
-| BR-004 | Unit | DELETE `/api/notes/-1` | 422, `"Invalid note ID"` |
-| BR-004 | Unit | DELETE `/api/notes/-999` | 422, `"Invalid note ID"` |
-| BR-004 | Unit | DELETE `/api/notes/abc` | 422 (FastAPI path type error) |
-| BR-005 | Integration | DELETE `/api/notes/9999` on empty DB | 404, `"Note not found"` |
-| BR-005 | Integration | DELETE valid ID, then DELETE same ID | Second DELETE → 404 |
-| BR-005 | Integration | DELETE valid ID that was just created | 200, `{"ok": true}` |
-| BR-006 | Contract | GET `/api/notes` — no Authorization header | 200 (no 401/403) |
-| BR-006 | Contract | POST `/api/notes` — no Authorization header | 201 (no 401/403) |
-| BR-006 | Contract | DELETE `/api/notes/1` — no Authorization header | 200 or 404 (no 401/403) |
-| BR-007 | Integration | Create note A then note B; GET `/api/notes` | Note B first in list (DESC order) |
-| BR-007 | Integration | Create 5 notes; GET `/api/notes` | All 5 returned newest-first |
-| BR-008 | Integration | POST with `content: "Hello 🎉"` | 201, stored content matches including emoji |
-| BR-008 | Integration | POST with content containing 4-byte Unicode (U+1F4A1) | 201, round-trips correctly |
-| BR-009 | Integration | POST note; inspect response `created_at` | `created_at` present, not null, UTC-aware |
-| BR-009 | Contract | POST with body `{"content": "x", "created_at": "2000-01-01"}` | `created_at` in response is DB time, not `"2000-01-01"` |
-| RISK-001 | Integration | Create, delete, delete again | Second delete → 404 (not silent ok:true) |
-| RISK-002 | Security | POST with SQL injection payload in content | 201, stored literally; no SQL error |
-| RISK-004 | Contract | GET `/api/notes/1` (wrong method for delete path) | 405 Method Not Allowed |
+| BR-001 | Unit | `NoteCreate(content="")` | `ValidationError`, message "Note cannot be empty" |
+| BR-001 | Unit | `NoteCreate(content="   ")` | `ValidationError` — spaces strip to empty |
+| BR-001 | Integration | `POST /api/notes` `{"content": ""}` | 422, detail contains "Note cannot be empty" |
+| BR-002 | Unit | `NoteCreate(content="x" * 501)` | `ValidationError`, message "Note too long (max 500 chars)" |
+| BR-002 | Unit | `NoteCreate(content="x" * 500)` | Valid — boundary accepted |
+| BR-002 | Integration | `POST /api/notes` with 501-char content | 422, detail contains "Note too long" |
+| BR-002 | Integration | `POST /api/notes` with 500-char content | 201 |
+| BR-003 | Unit | `NoteCreate(content="  hello  ")` | Returns with `content == "hello"` |
+| BR-003 | Integration | `POST /api/notes` `{"content": "  hello world  "}` | 201, response `content == "hello world"` |
+| BR-003 | Unit | Chain: `"   "` → strip → empty → reject | `ValidationError` "Note cannot be empty" |
+| BR-004 | Integration | `DELETE /api/notes/0` | 422, "Invalid note ID" |
+| BR-004 | Integration | `DELETE /api/notes/-5` | 422, "Invalid note ID" |
+| BR-004 | Integration | `DELETE /api/notes/abc` | 422 (FastAPI path-param type coercion) |
+| BR-005 | Integration | `DELETE /api/notes/99999` (non-existent) | 404, "Note not found" |
+| BR-005 | Integration | `DELETE /api/notes/{valid_id}` (existing) | 204 |
+| BR-006 | Integration | All three endpoints called without Authorization header | 200 / 201 / 204 — no auth error |
+| BR-006 | Static | Router has no auth dependencies | `router.dependencies == []` |
+| BR-007 | Integration | Create notes A, B, C in order; GET /api/notes | Returns [C, B, A] (newest first) |
+| BR-007 | Integration | Single note; GET /api/notes | Returns list with one item |
+| BR-007 | Integration | Empty table; GET /api/notes | Returns `{"notes": []}` with 200 |
+| BR-008 | Integration | POST note with emoji content; GET it back | Round-trips correctly |
+| BR-008 | Integration | POST note with 500 2-byte Unicode chars; GET | 201 accepted (character count, not byte count) |
+| BR-009 | Integration | POST /api/notes; inspect response | `created_at` populated, is timezone-aware |
+| BR-009 | Unit | `Note(content="x")` — do not pass `created_at` | Instantiates without error |
+| BR-010 (R-010) | Unit | `from app.models import Note` | No `InvalidRequestError` at import |
 
-### Full test file skeleton
+---
+
+### Happy Path Tests
 
 ```python
-# backend/tests/test_notes.py
+# tests/test_notes_api.py
 
-import pytest
-import pytest_asyncio
-
-pytestmark = pytest.mark.asyncio
-
-
-class TestGetNotes:
-    """GET /api/notes"""
-
-    async def test_empty_list(self, client):
-        resp = await client.get("/api/notes")
-        assert resp.status_code == 200
-        assert resp.json() == []
-
-    async def test_br007_newest_first(self, client):
-        """BR-007: notes returned in descending creation order."""
-        await client.post("/api/notes", json={"content": "first"})
-        await client.post("/api/notes", json={"content": "second"})
-        resp = await client.get("/api/notes")
-        notes = resp.json()
-        assert notes[0]["content"] == "second"
-        assert notes[1]["content"] == "first"
-
-    async def test_br006_no_auth_required(self, client):
-        """BR-006: GET requires no authentication."""
-        resp = await client.get("/api/notes")
-        assert resp.status_code != 401
-        assert resp.status_code != 403
+async def test_list_notes_empty(client):
+    response = await client.get("/api/notes")
+    assert response.status_code == 200
+    assert response.json() == {"notes": []}
 
 
-class TestCreateNote:
-    """POST /api/notes"""
-
-    async def test_create_success(self, client):
-        resp = await client.post("/api/notes", json={"content": "Hello"})
-        assert resp.status_code == 201
-        data = resp.json()
-        assert data["content"] == "Hello"
-        assert data["id"] > 0
-        assert data["created_at"] is not None
-
-    async def test_br003_trims_whitespace(self, client):
-        """BR-003: content is stripped before storage."""
-        resp = await client.post("/api/notes", json={"content": "  hello  "})
-        assert resp.status_code == 201
-        assert resp.json()["content"] == "hello"
-
-    async def test_br001_empty_string_rejected(self, client):
-        """BR-001: empty content rejected."""
-        resp = await client.post("/api/notes", json={"content": ""})
-        assert resp.status_code == 422
-        assert "Note cannot be empty" in str(resp.json())
-
-    async def test_br001_whitespace_only_rejected(self, client):
-        """BR-001+BR-003: whitespace-only content rejected after trim."""
-        resp = await client.post("/api/notes", json={"content": "   "})
-        assert resp.status_code == 422
-        assert "Note cannot be empty" in str(resp.json())
-
-    async def test_br002_exactly_500_chars_accepted(self, client):
-        """BR-002: 500 chars is the boundary — must be accepted."""
-        resp = await client.post("/api/notes", json={"content": "x" * 500})
-        assert resp.status_code == 201
-
-    async def test_br002_501_chars_rejected(self, client):
-        """BR-002: 501 chars exceeds limit."""
-        resp = await client.post("/api/notes", json={"content": "x" * 501})
-        assert resp.status_code == 422
-        assert "Note too long (max 500 chars)" in str(resp.json())
-
-    async def test_br008_emoji_stored_correctly(self, client):
-        """BR-008: 4-byte Unicode (emoji) stored without truncation."""
-        resp = await client.post("/api/notes", json={"content": "Hello 🎉"})
-        assert resp.status_code == 201
-        assert resp.json()["content"] == "Hello 🎉"
-
-    async def test_br009_created_at_set_by_db(self, client):
-        """BR-009: created_at present and timezone-aware; not supplied by app."""
-        resp = await client.post("/api/notes", json={"content": "test"})
-        assert resp.status_code == 201
-        assert resp.json()["created_at"] is not None
-
-    async def test_risk002_sql_injection_stored_literally(self, client):
-        """RISK-002: SQL injection payload stored as literal string."""
-        payload = "'; DROP TABLE notes; --"
-        resp = await client.post("/api/notes", json={"content": payload})
-        assert resp.status_code == 201
-        # Verify table still exists and content round-trips
-        notes = (await client.get("/api/notes")).json()
-        assert any(n["content"] == payload for n in notes)
-
-    async def test_br006_no_auth_required(self, client):
-        """BR-006: POST requires no authentication."""
-        resp = await client.post("/api/notes", json={"content": "test"})
-        assert resp.status_code not in (401, 403)
+async def test_create_note(client):
+    r = await client.post("/api/notes", json={"content": "hello"})
+    assert r.status_code == 201
+    data = r.json()
+    assert data["content"] == "hello"
+    assert isinstance(data["id"], int)
+    assert data["id"] > 0
+    assert "created_at" in data
 
 
-class TestDeleteNote:
-    """DELETE /api/notes/{note_id}"""
+async def test_list_notes_after_create(client):
+    await client.post("/api/notes", json={"content": "first"})
+    r = await client.get("/api/notes")
+    assert r.status_code == 200
+    assert len(r.json()["notes"]) == 1
 
-    async def test_delete_success(self, client):
-        create_resp = await client.post("/api/notes", json={"content": "delete me"})
-        note_id = create_resp.json()["id"]
-        resp = await client.delete(f"/api/notes/{note_id}")
-        assert resp.status_code == 200
-        assert resp.json() == {"ok": True}
 
-    async def test_br005_not_found_returns_404(self, client):
-        """BR-005: non-existent note returns 404, not silent success."""
-        resp = await client.delete("/api/notes/99999")
-        assert resp.status_code == 404
-        assert resp.json()["detail"] == "Note not found"
-
-    async def test_risk001_double_delete_returns_404(self, client):
-        """RISK-001: second delete of same note returns 404, not ok:true."""
-        create_resp = await client.post("/api/notes", json={"content": "once"})
-        note_id = create_resp.json()["id"]
-        await client.delete(f"/api/notes/{note_id}")
-        second = await client.delete(f"/api/notes/{note_id}")
-        assert second.status_code == 404
-
-    async def test_br004_zero_id_rejected(self, client):
-        """BR-004: note_id=0 rejected."""
-        resp = await client.delete("/api/notes/0")
-        assert resp.status_code == 422
-        assert "Invalid note ID" in str(resp.json())
-
-    async def test_br004_negative_id_rejected(self, client):
-        """BR-004: negative note_id rejected."""
-        resp = await client.delete("/api/notes/-1")
-        assert resp.status_code == 422
-        assert "Invalid note ID" in str(resp.json())
-
-    async def test_br004_non_integer_id_rejected(self, client):
-        """BR-004: non-integer path segment rejected by FastAPI path coercion."""
-        resp = await client.delete("/api/notes/abc")
-        assert resp.status_code == 422
-
-    async def test_risk004_get_method_not_accepted(self, client):
-        """RISK-004: DELETE path does not accept GET requests."""
-        resp = await client.get("/api/notes/1")
-        assert resp.status_code == 405
-
-    async def test_br006_no_auth_required(self, client):
-        """BR-006: DELETE requires no authentication."""
-        create_resp = await client.post("/api/notes", json={"content": "auth test"})
-        note_id = create_resp.json()["id"]
-        resp = await client.delete(f"/api/notes/{note_id}")
-        assert resp.status_code not in (401, 403)
+async def test_delete_note(client, seed_notes):
+    note_id = seed_notes[0].id
+    r = await client.delete(f"/api/notes/{note_id}")
+    assert r.status_code == 204
+    r2 = await client.get("/api/notes")
+    ids = [n["id"] for n in r2.json()["notes"]]
+    assert note_id not in ids
 ```
 
 ---
 
-## File Structure for CodeGen
+### BR Violation Tests
 
-The CodeGen agent must produce the following file tree under the backend output directory:
+```python
+async def test_empty_content_rejected(client):
+    r = await client.post("/api/notes", json={"content": ""})
+    assert r.status_code == 422
 
-```
-backend/
-├── main.py          # FastAPI app, lifespan, router registration
-├── database.py      # Engine, session factory, get_db dependency
-├── models.py        # SQLAlchemy 2.x ORM Note model + Base
-├── schemas.py       # Pydantic v2 NoteCreate, NoteResponse, DeleteResponse
-├── router.py        # FastAPI router with 3 endpoints
-├── service.py       # NoteService with get_notes, create_note, delete_note
-└── tests/
-    ├── conftest.py  # Async fixtures: db_engine, db_session, client
-    └── test_notes.py # Full BR test suite (all 9 BRs + RISK cases)
+
+async def test_whitespace_only_rejected(client):
+    r = await client.post("/api/notes", json={"content": "   "})
+    assert r.status_code == 422
+
+
+async def test_too_long_content_rejected(client):
+    r = await client.post("/api/notes", json={"content": "a" * 501})
+    assert r.status_code == 422
+
+
+async def test_exactly_500_chars_accepted(client):
+    r = await client.post("/api/notes", json={"content": "x" * 500})
+    assert r.status_code == 201
+
+
+async def test_delete_zero_id(client):
+    r = await client.delete("/api/notes/0")
+    assert r.status_code == 422
+
+
+async def test_delete_negative_id(client):
+    r = await client.delete("/api/notes/-1")
+    assert r.status_code == 422
+
+
+async def test_delete_nonexistent_note(client):
+    r = await client.delete("/api/notes/999999")
+    assert r.status_code == 404
+    assert r.json()["detail"] == "Note not found"
 ```
 
 ---
 
-## BR Coverage Matrix
+### Edge Cases from Risk Register
 
-| BR ID | Description | Enforced in | Layer |
-|-------|-------------|-------------|-------|
-| BR-001 | Empty content rejected | `NoteCreate.validate_content` (step 2) | Pydantic + DB CHECK |
-| BR-002 | Max 500 chars | `NoteCreate.validate_content` (step 3); `String(500)` | Pydantic + ORM + DDL |
-| BR-003 | Trim before validate + store | `NoteCreate.validate_content` (step 1) | Pydantic |
-| BR-004 | Positive integer ID | `delete_note` router handler guard | Router |
-| BR-005 | 404 on missing note delete | `NoteService.delete_note` rowcount check | Service |
-| BR-006 | No authentication | No auth middleware registered | Architecture |
-| BR-007 | Newest-first order | `NoteService.get_notes` ORDER BY | Service + DDL index |
-| BR-008 | UTF-8 4-byte support | PostgreSQL native UTF-8 | Database |
-| BR-009 | DB-managed created_at | `server_default=func.now()`, `init=False` | ORM + DDL |
+```python
+async def test_note_ordering_newest_first(client):
+    """BR-007: ORDER BY created_at DESC is non-negotiable."""
+    for content in ["first", "second", "third"]:
+        await client.post("/api/notes", json={"content": content})
+    r = await client.get("/api/notes")
+    notes = r.json()["notes"]
+    assert notes[0]["content"] == "third"
+    assert notes[1]["content"] == "second"
+    assert notes[2]["content"] == "first"
+
+
+async def test_trim_is_stored_not_display_only(client):
+    """BR-003: trimmed value persisted, confirmed by round-trip."""
+    r = await client.post("/api/notes", json={"content": "  padded  "})
+    assert r.status_code == 201
+    assert r.json()["content"] == "padded"
+    note_id = r.json()["id"]
+    r2 = await client.get("/api/notes")
+    note = next(n for n in r2.json()["notes"] if n["id"] == note_id)
+    assert note["content"] == "padded"
+
+
+async def test_unicode_4byte_content(client):
+    """BR-008: 4-byte UTF-8 (emoji) must round-trip correctly."""
+    r = await client.post("/api/notes", json={"content": "Hello 🌍"})
+    assert r.status_code == 201
+    assert r.json()["content"] == "Hello 🌍"
+
+
+async def test_multibyte_character_count_not_byte_count(client):
+    """BR-002/RISK-006: 500 two-byte characters must be accepted (character semantics)."""
+    content = "é" * 500  # each 'é' is 2 bytes in UTF-8 — 1000 bytes total
+    r = await client.post("/api/notes", json={"content": content})
+    assert r.status_code == 201
+
+
+async def test_created_at_timezone_aware(client):
+    """BR-009/RISK-008: created_at must include timezone offset."""
+    r = await client.post("/api/notes", json={"content": "tz check"})
+    created_at = r.json()["created_at"]
+    assert "+" in created_at or created_at.endswith("Z")
+
+
+async def test_no_auth_required_on_all_endpoints(client):
+    """BR-006: CRITICAL — no auth on any endpoint."""
+    r = await client.get("/api/notes")
+    assert r.status_code == 200
+    r = await client.post("/api/notes", json={"content": "auth test"})
+    assert r.status_code == 201
+    note_id = r.json()["id"]
+    r = await client.delete(f"/api/notes/{note_id}")
+    assert r.status_code == 204
+
+
+async def test_sql_injection_payload_stored_as_literal(client):
+    """RISK-003: injection payload must be stored as text, not executed."""
+    payload = "'; DROP TABLE notes; --"
+    r = await client.post("/api/notes", json={"content": payload})
+    assert r.status_code == 201
+    assert r.json()["content"] == payload
+    # Verify table still exists
+    r2 = await client.get("/api/notes")
+    assert r2.status_code == 200
+
+
+async def test_mapper_init_no_error():
+    """RISK-010/BR-010: DeclarativeBase ORM model must not raise InvalidRequestError."""
+    from app.models import Note  # import triggers mapper configuration
+    note = Note(content="mapper check")
+    assert note.content == "mapper check"
+```
