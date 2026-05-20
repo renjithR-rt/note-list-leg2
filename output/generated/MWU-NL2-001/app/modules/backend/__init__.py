@@ -1,1 +1,0 @@
-"""Backend module for note management."""
